@@ -1,7 +1,7 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { createBranchFromLatest, defaultBranch, isGitRepo, listBranches } from './gitOps';
-import { detectLanguages, frameworksFor, FRAMEWORKS } from './detectLanguage';
+import { createBranchFromLatest, defaultBranch, isGitRepo, listBranches, trackedFiles } from './gitOps';
+import { detectProjects, frameworksFor, rankLanguages } from './detectLanguage';
 import { renderReportMarkdown, runGeneration } from './testRunner';
 import { getHtml } from './webview';
 import { AppState, Progress, Stage, WebviewMessage } from './types';
@@ -11,7 +11,16 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
 
   private view?: vscode.WebviewView;
   private cancelRequested = false;
-  private state: AppState = { languages: [], frameworks: [], branches: [], branchReady: false, running: false };
+  private state: AppState = {
+    projects: [],
+    languages: [],
+    frameworks: [],
+    detectedFrameworks: [],
+    frameworkNeeded: false,
+    branches: [],
+    branchReady: false,
+    running: false,
+  };
 
   resolveWebviewView(view: vscode.WebviewView): void {
     this.view = view;
@@ -35,9 +44,7 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
           this.resetRepo();
           break;
         case 'setLanguage':
-          this.state.language = msg.value;
-          this.state.frameworks = frameworksFor(msg.value);
-          this.state.framework = this.state.frameworks[0];
+          this.applyLanguage(msg.value);
           break;
         case 'setFramework':
           this.state.framework = msg.value;
@@ -109,22 +116,36 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
       throw new Error('The selected folder is not a git repository.');
     }
 
-    const detected = await detectLanguages(repo);
+    const projects = await detectProjects(repo, await trackedFiles(repo));
+    if (projects.length === 0) {
+      throw new Error('No supported project found. Supported: Python, TypeScript/JavaScript, Java, C# and Go.');
+    }
     const branches = await listBranches(repo);
     const remoteDefault = await defaultBranch(repo);
-    const languages = detected.length ? detected : Object.keys(FRAMEWORKS);
-    const language = languages[0];
-    const frameworks = frameworksFor(language);
 
     this.resetRepo();
     this.state.repoPath = repo;
-    this.state.languages = languages;
-    this.state.language = language;
-    this.state.frameworks = frameworks;
-    this.state.framework = frameworks[0];
+    this.state.projects = projects;
+    this.state.languages = rankLanguages(projects);
+    this.applyLanguage(this.state.languages[0]);
     this.state.branches = branches;
     this.state.baseBranch = pickBaseBranch(branches, remoteDefault);
     this.state.newBranch = defaultNewBranchName();
+  }
+
+  // Sets the language and works out the framework. A framework is only asked for when
+  // some project of this language has no existing tests to read it from.
+  private applyLanguage(language: string): void {
+    const own = this.state.projects.filter(p => p.language === language);
+    const detected = [...new Set(own.map(p => p.framework).filter((f): f is string => !!f))];
+    const frameworkNeeded = own.some(p => !p.framework);
+    const frameworks = frameworksFor(language);
+
+    this.state.language = language;
+    this.state.frameworks = frameworks;
+    this.state.detectedFrameworks = detected;
+    this.state.frameworkNeeded = frameworkNeeded;
+    this.state.framework = frameworkNeeded ? frameworks[0] : detected[0];
   }
 
   private resetRepo(): void {
@@ -134,9 +155,12 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
     this.state = {
       ...this.state,
       repoPath: undefined,
+      projects: [],
       languages: [],
       language: undefined,
       frameworks: [],
+      detectedFrameworks: [],
+      frameworkNeeded: false,
       framework: undefined,
       branches: [],
       baseBranch: undefined,
@@ -157,19 +181,23 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async start(): Promise<void> {
-    const { repoPath, newBranch, language, framework, branchReady, running } = this.state;
+    const { repoPath, newBranch, language, framework, frameworkNeeded, branchReady, running } = this.state;
     if (running) return;
-    if (!repoPath || !newBranch || !language || !framework || !branchReady) {
+    if (!repoPath || !newBranch || !language || !branchReady) {
       throw new Error('Create the working branch before starting.');
     }
+    if (frameworkNeeded && !framework) {
+      throw new Error('Choose a test framework first.');
+    }
 
+    const projects = this.state.projects.filter(p => p.language === language);
     this.state.running = true;
     this.state.report = undefined;
     this.cancelRequested = false;
     this.post();
     try {
       this.state.report = await runGeneration(
-        { repoPath, branch: newBranch, language, framework },
+        { repoPath, branch: newBranch, language, framework, projects },
         (progress: Progress) => {
           this.state.progress = progress;
           this.post();

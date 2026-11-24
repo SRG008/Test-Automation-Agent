@@ -72,13 +72,19 @@ export function getHtml(cspSource: string): string {
       + btn('Select Repository Folder', 'selectFolder')
       + errorBlock();
   }
+  function frameworkText() {
+    return state.frameworkNeeded ? state.framework : (state.detectedFrameworks || []).join(', ');
+  }
   function renderBranch() {
     var langField = state.languages.length > 1
       ? selectField('Language', 'setLanguage', state.languages, state.language)
       : '<p class="muted">Language: ' + esc(state.language) + '</p>';
+    var fwField = state.frameworkNeeded
+      ? selectField('Test framework', 'setFramework', state.frameworks, state.framework)
+      : '<p class="muted">Existing tests use: ' + esc(frameworkText()) + '</p>';
     return '<h2>Auto Tests</h2>' + connectedLine() + repoLine() + '<hr>'
       + langField
-      + selectField('Test framework', 'setFramework', state.frameworks, state.framework)
+      + fwField
       + selectField('Base branch', 'setBaseBranch', state.branches, state.baseBranch)
       + '<label>New branch name</label><input data-change="setNewBranch" value="' + esc(state.newBranch) + '">'
       + btn('Pull Latest & Create Branch', 'createBranch')
@@ -88,7 +94,7 @@ export function getHtml(cspSource: string): string {
   function renderReady() {
     return '<h2>Auto Tests</h2>' + connectedLine() + repoLine() + '<hr>'
       + '<p class="ok">✓ Created branch <b>' + esc(state.newBranch) + '</b></p>'
-      + '<p class="muted">From latest ' + esc(state.baseBranch) + ' · ' + esc(state.framework) + '</p>'
+      + '<p class="muted">From latest ' + esc(state.baseBranch) + ' · ' + esc(frameworkText()) + '</p>'
       + btn('▶ Start Test Generation', 'start')
       + btn('Change Repository', 'changeRepo', 'secondary')
       + errorBlock();
@@ -110,21 +116,19 @@ export function getHtml(cspSource: string): string {
   }
   function renderDone() {
     var r = state.report;
-    var total = r.testsPassed + r.testsFailed;
     var files = r.files.length
       ? r.files.map(function (f) {
-          var result = f.failed
-            ? '<span class="fail">✗ ' + f.failed + ' failed</span>'
-            : '<span class="ok">✓ ' + f.passed + ' passed</span>';
+          var result = f.status === 'written'
+            ? '<span class="ok">✓ written</span>'
+            : '<span class="fail">✗ skipped</span>';
           return '<button class="file" data-open="' + esc(f.path) + '"><span>' + esc(f.path) + '</span>' + result + '</button>';
         }).join('')
       : '<p class="muted">No test files written.</p>';
     return '<h2>Completed</h2>'
       + '<p class="ok">✓ Completed on <b>' + esc(r.branch) + '</b></p>'
       + '<div class="stat"><span>Files written</span><span>' + r.filesWritten + '</span></div>'
-      + '<div class="stat"><span>Tests passed</span><span>' + r.testsPassed + ' / ' + total + '</span></div>'
-      + '<div class="stat"><span>Coverage</span><span>' + r.coverageBefore + '% → ' + r.coverageAfter + '%</span></div>'
-      + '<div class="stat"><span>Skipped</span><span>' + r.skipped + '</span></div>'
+      + '<div class="stat"><span>Files skipped</span><span>' + r.filesSkipped + '</span></div>'
+      + '<div class="stat"><span>Function coverage</span><span>' + r.coverageBefore + '% → ' + r.coverageAfter + '%</span></div>'
       + btn('View Full Report', 'openReport')
       + btn('Run Again', 'start', 'secondary')
       + btn('Change Repository', 'changeRepo', 'secondary')
