@@ -2,10 +2,14 @@
   "name": "auto-unit-test-agent",
   "displayName": "Auto Unit Test Agent",
   "description": "Generates unit tests in the background on a new branch using your GitHub Copilot.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "local",
   "private": true,
   "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SRG008/Test-Automation-Agent.git"
+  },
   "engines": {
     "vscode": "^1.90.0"
   },

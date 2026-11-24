@@ -27,6 +27,12 @@ Then press F5 in VS Code to launch an Extension Development Host.
 
 ## Package
 
+Run these after each code change. Each run bumps the patch version in `package.json` and writes a new `auto-unit-test-agent-<version>.vsix` file.
+
 ```powershell
-npx @vscode/vsce package
+npm install
+npm run compile
+npx @vscode/vsce package patch --no-git-tag-version
 ```
+
+To install the `.vsix` locally, run **Extensions: Install from VSIX** in VS Code, or `code --install-extension <file>.vsix`. A higher version replaces the installed one.
