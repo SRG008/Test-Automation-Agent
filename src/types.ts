@@ -59,6 +59,8 @@ export interface ToolCheck {
   ok: boolean;
   hint: string;
   url: string;
+  // Required tools block the agent until installed. Test frameworks are optional: the agent installs them on Start.
+  required: boolean;
 }
 
 export interface AppState {

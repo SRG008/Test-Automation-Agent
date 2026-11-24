@@ -5,7 +5,7 @@ import { detectProjects, frameworksFor, rankLanguages } from './detectLanguage';
 import { checkTools } from './preflight';
 import { renderReportMarkdown, runGeneration } from './testRunner';
 import { getHtml } from './webview';
-import { AppState, Progress, Stage, WebviewMessage } from './types';
+import { AppState, Progress, Stage, ToolCheck, WebviewMessage } from './types';
 
 export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
   static readonly viewType = 'autoTests.panel';
@@ -47,6 +47,7 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
           break;
         case 'setFramework':
           this.state.framework = msg.value;
+          await this.refreshTools();
           break;
         case 'setBaseBranch':
           this.state.baseBranch = msg.value;
@@ -153,13 +154,18 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
 
   // Checks the tools the current language needs. Branch creation and generation stay blocked while any are missing.
   private async refreshTools(): Promise<void> {
-    const { repoPath, language, projects } = this.state;
+    const { repoPath, language, projects, framework } = this.state;
     if (!repoPath || !language) return;
-    this.state.tools = await checkTools(repoPath, language, projects.filter(p => p.language === language));
+    this.state.tools = await checkTools(repoPath, language, projects.filter(p => p.language === language), framework);
   }
 
-  private missingTools(): string[] {
-    return this.state.tools.filter(t => !t.ok).map(t => t.name);
+  private missingTools(): ToolCheck[] {
+    return this.state.tools.filter(t => t.required && !t.ok);
+  }
+
+  // Tells the user what to install, with the same steps the checklist shows.
+  private missingToolsError(missing: ToolCheck[]): string {
+    return `Install the tools below first. ${missing.map(t => `${t.name}: ${t.hint}`).join('. ')}.`;
   }
 
   // Sets the language and works out the framework. A framework is only asked for when
@@ -208,7 +214,7 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
     }
     const missing = this.missingTools();
     if (missing.length > 0) {
-      throw new Error(`Install ${missing.join(', ')}, then press Recheck tools.`);
+      throw new Error(this.missingToolsError(missing));
     }
     await createBranchFromLatest(repoPath, baseBranch, newBranch);
     this.state.branchReady = true;
@@ -225,7 +231,7 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
     }
     const missing = this.missingTools();
     if (missing.length > 0) {
-      throw new Error(`Install ${missing.join(', ')}, then press Recheck tools.`);
+      throw new Error(this.missingToolsError(missing));
     }
 
     const projects = this.state.projects.filter(p => p.language === language);
