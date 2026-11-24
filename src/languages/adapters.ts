@@ -111,14 +111,19 @@ const python: LanguageAdapter = {
   async ensureTooling(ctx) {
     const py = await pythonFor(ctx.repo);
     if ((await runCommand(py, ['--version'], ctx.repo)).code !== 0) {
-      return 'Python was not found on PATH. Install Python, then try again.';
+      return 'Python was not found. Install Python 3 from https://www.python.org/downloads/, restart VS Code, then click Recheck.';
     }
     const missing: string[] = [];
     if (ctx.framework !== 'unittest' && (await runCommand(py, ['-m', 'pytest', '--version'], ctx.repo)).code !== 0) missing.push('pytest');
     if ((await runCommand(py, ['-m', 'coverage', '--version'], ctx.repo)).code !== 0) missing.push('coverage');
     if (missing.length === 0) return undefined;
     const install = await runCommand(py, ['-m', 'pip', 'install', ...missing], ctx.repo);
-    return install.code === 0 ? undefined : `Could not install ${missing.join(', ')}:\n${install.output}`;
+    if (install.code === 0) return undefined;
+    return installFailure(
+      missing.join(', '),
+      install.output,
+      `run "${py}" -m pip install ${missing.join(' ')} in the repository and read the error it prints. If pip is missing, run "${py}" -m ensurepip --upgrade. Check network or proxy access to PyPI, then click Start again.`,
+    );
   },
   async runTests(ctx, testRel) {
     const py = await pythonFor(ctx.repo);
@@ -165,6 +170,25 @@ const TS_EXTRAS: Record<string, string[]> = {
 };
 
 const isTsFile = (rel: string): boolean => /\.tsx?$/.test(rel);
+
+// Installs dev dependencies. npm can refuse a tool over an optional peer conflict (e.g. @types/node
+// versions), so it retries with --legacy-peer-deps, which only skips peer checks for these installs.
+async function npmInstallDev(repo: string, packages: string[]): Promise<CommandResult> {
+  const first = await runCommand('npm', ['install', '-D', ...packages], repo, 600_000);
+  if (first.code === 0 || !first.output.includes('ERESOLVE')) return first;
+  return runCommand('npm', ['install', '-D', '--legacy-peer-deps', ...packages], repo, 600_000);
+}
+
+// The message shown when an install fails: the error lines from the tool, then the steps to fix it.
+function installFailure(what: string, output: string, fix: string): string {
+  const errors = output
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(line => /error|failed|not found|denied|unable/i.test(line))
+    .slice(0, 4);
+  const detail = errors.length > 0 ? errors.join('\n') : output.trim().slice(-600);
+  return `Could not install ${what}.\n${detail}\nHow to fix: ${fix}`;
+}
 
 // ts-jest is the transform for TypeScript tests, so write a config for it when the repo has none.
 async function ensureJestConfig(ctx: AdapterContext, pkg: { type?: string; jest?: unknown }): Promise<void> {
@@ -224,16 +248,30 @@ const typescript: LanguageAdapter = {
     const isTs = ctx.files.some(isTsFile);
     const missing = [tool, ...(isTs ? TS_EXTRAS[ctx.framework] ?? [] : [])].filter(p => !(p in deps));
     if (missing.length > 0) {
-      const install = await runCommand('npm', ['install', '-D', ...missing], ctx.repo, 600_000);
-      if (install.code !== 0) return `Could not install ${missing.join(', ')}:\n${install.output}`;
+      const install = await npmInstallDev(ctx.repo, missing);
+      if (install.code !== 0) {
+        return installFailure(
+          missing.join(', '),
+          install.output,
+          `run "npm install -D ${missing.join(' ')}" in the repository and fix the error it prints. Use Node.js 18 or newer, and check access to the npm registry. If the error is about conflicting versions in package.json, align the versions it names and click Start again.`,
+        );
+      }
     }
     if (ctx.framework === 'Jest' && isTs) await ensureJestConfig(ctx, pkg);
-    // The v8 provider must match the installed Vitest version.
-    if (ctx.framework === 'Vitest' && !('@vitest/coverage-v8' in deps)) {
-      const version = deps.vitest?.replace(/^[\^~>=<\s]+/, '');
+    // The v8 provider must match the installed Vitest version, so read it after the install above.
+    const installed = JSON.parse(await fs.readFile(path.join(ctx.repo, 'package.json'), 'utf8')) as typeof pkg;
+    const allDeps = { ...installed.dependencies, ...installed.devDependencies };
+    if (ctx.framework === 'Vitest' && !('@vitest/coverage-v8' in allDeps)) {
+      const version = allDeps.vitest?.replace(/^[\^~>=<\s]+/, '');
       const spec = version && /^\d/.test(version) ? `@vitest/coverage-v8@${version}` : '@vitest/coverage-v8';
-      const install = await runCommand('npm', ['install', '-D', spec], ctx.repo, 600_000);
-      if (install.code !== 0) return `Could not install @vitest/coverage-v8:\n${install.output}`;
+      const install = await npmInstallDev(ctx.repo, [spec]);
+      if (install.code !== 0) {
+        return installFailure(
+          '@vitest/coverage-v8',
+          install.output,
+          `run "npm install -D ${spec}" in the repository and fix the error it prints, then click Start again.`,
+        );
+      }
     }
     return undefined;
   },
@@ -307,7 +345,9 @@ const go: LanguageAdapter = {
   testPathFor: rel => joinRel(dirOf(rel), `${stemOf(rel)}_test.go`),
   async ensureTooling(ctx) {
     if (!ctx.files.includes('go.mod')) return 'No go.mod found at the repository root.';
-    return (await runCommand('go', ['version'], ctx.repo)).code === 0 ? undefined : 'Go was not found on PATH.';
+    return (await runCommand('go', ['version'], ctx.repo)).code === 0
+      ? undefined
+      : 'Go was not found. Install Go from https://go.dev/dl/, restart VS Code, then click Recheck.';
   },
   runTests: (ctx, testRel) => runCommand('go', ['test', `./${dirOf(testRel)}`], ctx.repo),
   async coverage(ctx) {
@@ -439,7 +479,13 @@ async function ensureCoverlet(ctx: AdapterContext): Promise<string | undefined> 
     const xml = await fs.readFile(path.join(ctx.repo, proj), 'utf8').catch(() => '');
     if (/coverlet\.collector/i.test(xml)) continue;
     const add = await runCommand('dotnet', ['add', proj, 'package', 'coverlet.collector'], ctx.repo, 600_000);
-    if (add.code !== 0) return `Could not add coverlet.collector to ${proj}:\n${add.output}`;
+    if (add.code !== 0) {
+      return installFailure(
+        `coverlet.collector in ${proj}`,
+        add.output,
+        `run "dotnet add ${proj} package coverlet.collector" in the repository and read the error. Check that nuget.org (or your NuGet feed) is reachable with "dotnet nuget list source", then click Start again.`,
+      );
+    }
   }
   return undefined;
 }
@@ -480,7 +526,7 @@ const csharp: LanguageAdapter = {
   },
   async ensureTooling(ctx) {
     if ((await runCommand('dotnet', ['--version'], ctx.repo)).code !== 0) {
-      return '.NET SDK was not found. Install it, then try again.';
+      return '.NET SDK was not found. Install it from https://dotnet.microsoft.com/download, restart VS Code, then click Recheck.';
     }
     const existing = csTestProject(ctx);
     if (existing) {
@@ -489,7 +535,13 @@ const csharp: LanguageAdapter = {
       if (!xml.toLowerCase().includes(`include="${CS_PACKAGES[ctx.framework][0].toLowerCase()}"`)) {
         for (const pkg of CS_PACKAGES[ctx.framework]) {
           const add = await runCommand('dotnet', ['add', existing, 'package', pkg], ctx.repo, 600_000);
-          if (add.code !== 0) return `Could not add ${pkg} to ${existing}:\n${add.output}`;
+          if (add.code !== 0) {
+            return installFailure(
+              `${pkg} in ${existing}`,
+              add.output,
+              `run "dotnet add ${existing} package ${pkg}" in the repository and read the error. Check that nuget.org (or your NuGet feed) is reachable with "dotnet nuget list source", then click Start again.`,
+            );
+          }
         }
       }
       return ensureCoverlet(ctx);
@@ -501,10 +553,22 @@ const csharp: LanguageAdapter = {
     const dir = dirOf(planned);
     const name = stemOf(planned);
     const created = await runCommand('dotnet', ['new', CS_TEMPLATE[ctx.framework], '-n', name, '-o', dir || '.'], ctx.repo);
-    if (created.code !== 0) return `Could not create the ${ctx.framework} test project:\n${created.output}`;
+    if (created.code !== 0) {
+      return installFailure(
+        `the ${ctx.framework} test project`,
+        created.output,
+        `run "dotnet new list" to confirm the ${CS_TEMPLATE[ctx.framework]} template is available, and fix the error it prints. Then click Start again.`,
+      );
+    }
     await fs.rm(path.join(ctx.repo, dir, 'UnitTest1.cs'), { force: true });
     const linked = await runCommand('dotnet', ['add', planned, 'reference', src], ctx.repo);
-    if (linked.code !== 0) return `Could not reference the source project:\n${linked.output}`;
+    if (linked.code !== 0) {
+      return installFailure(
+        `the reference from ${planned} to ${src}`,
+        linked.output,
+        `run "dotnet add ${planned} reference ${src}" in the repository and fix the error it prints, then click Start again.`,
+      );
+    }
 
     const srcPath = path.join(ctx.repo, src);
     const srcXml = await fs.readFile(srcPath, 'utf8');

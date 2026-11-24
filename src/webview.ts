@@ -63,12 +63,18 @@ export function getHtml(cspSource: string): string {
   }
   function repoLine() { return '<p class="muted">Repository: ' + esc(state.repoPath) + '</p>'; }
   function missingNames() {
-    return (state.tools || []).filter(function (t) { return !t.ok; }).map(function (t) { return t.name; });
+    return (state.tools || []).filter(function (t) { return t.required && !t.ok; }).map(function (t) { return t.name; });
   }
   function toolsBlock() {
     var tools = state.tools || [];
     if (tools.length === 0) return '';
     var rows = tools.map(function (t) {
+      if (!t.required) {
+        // Framework rows are informational: a missing one is installed on Start.
+        var mark = t.ok ? '<span class="ok">✓</span>' : '<span class="muted">○</span>';
+        var text = t.ok ? '' : ' <span class="muted">' + esc(t.hint) + '</span>';
+        return '<div class="step">' + mark + ' ' + esc(t.name) + text + '</div>';
+      }
       var status = t.ok ? '<span class="ok">✓</span>' : '<span class="fail">✗</span>';
       var help = t.ok ? '' : ' <button class="btn secondary" data-url="' + esc(t.url) + '">' + esc(t.hint) + '</button>';
       return '<div class="step">' + status + ' ' + esc(t.name) + help + '</div>';
@@ -77,7 +83,9 @@ export function getHtml(cspSource: string): string {
   }
   function installNote() {
     var missing = missingNames();
-    return missing.length ? '<p class="muted">Install ' + esc(missing.join(', ')) + ' to continue and generate the tests.</p>' : '';
+    return missing.length
+      ? '<p class="muted">Install the tools marked ✗ to continue. Each button opens its download page. Restart VS Code after installing, then click Recheck tools.</p>'
+      : '';
   }
   // Shows Recheck tools in place of the action while a required tool is missing.
   function gateButton(label, action) {
