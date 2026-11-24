@@ -26,6 +26,20 @@ export async function trackedFiles(repo: string): Promise<string[]> {
   return out ? out.split('\n') : [];
 }
 
+// The git repository root that contains the given folder.
+export async function repoRoot(folder: string): Promise<string> {
+  return git(folder, ['rev-parse', '--show-toplevel']);
+}
+
+// The checked-out branch, or undefined when HEAD is detached.
+export async function currentBranch(repo: string): Promise<string | undefined> {
+  return (await git(repo, ['branch', '--show-current'])) || undefined;
+}
+
+export async function isWorkingTreeClean(repo: string): Promise<boolean> {
+  return (await git(repo, ['status', '--porcelain'])) === '';
+}
+
 export async function listBranches(repo: string): Promise<string[]> {
   const out = await git(repo, ['for-each-ref', '--format=%(refname:short)', 'refs/heads', 'refs/remotes/origin']);
   const names = out
@@ -36,19 +50,7 @@ export async function listBranches(repo: string): Promise<string[]> {
   return [...new Set(names)].sort();
 }
 
-export async function defaultBranch(repo: string): Promise<string | undefined> {
-  try {
-    const ref = await git(repo, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD']);
-    return ref.replace(/^origin\//, '');
-  } catch {
-    return undefined;
-  }
-}
-
-export async function isWorkingTreeClean(repo: string): Promise<boolean> {
-  return (await git(repo, ['status', '--porcelain'])) === '';
-}
-
+// Pulls the latest of the chosen base branch from origin, then creates the new branch on top of it.
 // Never stashes or discards local work: a dirty tree stops the operation.
 export async function createBranchFromLatest(repo: string, base: string, newBranch: string): Promise<void> {
   if (!(await isWorkingTreeClean(repo))) {

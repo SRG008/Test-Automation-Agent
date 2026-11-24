@@ -8,12 +8,18 @@ export interface CommandResult {
 const MAX_OUTPUT = 12000;
 
 // Runs a command in cwd and resolves with its exit code and the tail of its combined output.
-export function runCommand(command: string, args: string[], cwd: string, timeoutMs = 300_000): Promise<CommandResult> {
+export function runCommand(
+  command: string,
+  args: string[],
+  cwd: string,
+  timeoutMs = 300_000,
+  env?: NodeJS.ProcessEnv,
+): Promise<CommandResult> {
   return new Promise(resolve => {
     const onWindows = process.platform === 'win32';
     // With shell: true on Windows, a path containing spaces must be quoted.
     const exe = onWindows && command.includes(' ') ? `"${command}"` : command;
-    const child = spawn(exe, args, { cwd, shell: onWindows, windowsHide: true });
+    const child = spawn(exe, args, { cwd, shell: onWindows, windowsHide: true, env: env ? { ...process.env, ...env } : undefined });
     let output = '';
     const collect = (chunk: Buffer) => {
       output += chunk.toString();

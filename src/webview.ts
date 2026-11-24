@@ -47,6 +47,9 @@ export function getHtml(cspSource: string): string {
   function btn(label, action, cls) {
     return '<button class="btn ' + (cls || '') + '" data-action="' + action + '">' + esc(label) + '</button>';
   }
+  function covText(s) {
+    return (s.total === 0 ? 100 : Math.round(s.covered / s.total * 100)) + '% (' + s.covered + '/' + s.total + ')';
+  }
   function selectField(label, change, options, value) {
     var html = '<label>' + esc(label) + '</label><select data-change="' + change + '">';
     (options || []).forEach(function (o) {
@@ -59,6 +62,27 @@ export function getHtml(cspSource: string): string {
     return '<p class="ok">✓ Connected to Copilot' + (state.model ? ' (' + esc(state.model) + ')' : '') + '</p>';
   }
   function repoLine() { return '<p class="muted">Repository: ' + esc(state.repoPath) + '</p>'; }
+  function missingNames() {
+    return (state.tools || []).filter(function (t) { return !t.ok; }).map(function (t) { return t.name; });
+  }
+  function toolsBlock() {
+    var tools = state.tools || [];
+    if (tools.length === 0) return '';
+    var rows = tools.map(function (t) {
+      var status = t.ok ? '<span class="ok">✓</span>' : '<span class="fail">✗</span>';
+      var help = t.ok ? '' : ' <button class="btn secondary" data-url="' + esc(t.url) + '">' + esc(t.hint) + '</button>';
+      return '<div class="step">' + status + ' ' + esc(t.name) + help + '</div>';
+    }).join('');
+    return '<p class="muted">Required tools for ' + esc(state.language) + '</p>' + rows;
+  }
+  function installNote() {
+    var missing = missingNames();
+    return missing.length ? '<p class="muted">Install ' + esc(missing.join(', ')) + ' to continue and generate the tests.</p>' : '';
+  }
+  // Shows Recheck tools in place of the action while a required tool is missing.
+  function gateButton(label, action) {
+    return missingNames().length ? btn('Recheck tools', 'recheckTools', 'secondary') : btn(label, action);
+  }
 
   function renderConnect() {
     return '<h2>Auto Tests</h2>'
@@ -68,8 +92,8 @@ export function getHtml(cspSource: string): string {
   }
   function renderRepo() {
     return '<h2>Auto Tests</h2>' + connectedLine()
-      + '<p>Select the cloned repository folder to continue.</p>'
-      + btn('Select Repository Folder', 'selectFolder')
+      + '<p>Open the repository in VS Code (File &gt; Open Folder), then press Retry.</p>'
+      + btn('Retry', 'connect')
       + errorBlock();
   }
   function frameworkText() {
@@ -79,24 +103,34 @@ export function getHtml(cspSource: string): string {
     var langField = state.languages.length > 1
       ? selectField('Language', 'setLanguage', state.languages, state.language)
       : '<p class="muted">Language: ' + esc(state.language) + '</p>';
+    if (missingNames().length > 0) {
+      return '<h2>Auto Tests</h2>' + connectedLine() + repoLine() + '<hr>'
+        + langField
+        + toolsBlock()
+        + installNote()
+        + btn('Recheck tools', 'recheckTools', 'secondary')
+        + errorBlock();
+    }
     var fwField = state.frameworkNeeded
       ? selectField('Test framework', 'setFramework', state.frameworks, state.framework)
       : '<p class="muted">Existing tests use: ' + esc(frameworkText()) + '</p>';
     return '<h2>Auto Tests</h2>' + connectedLine() + repoLine() + '<hr>'
       + langField
       + fwField
+      + toolsBlock()
+      + '<p class="muted">Pulls the latest of the base branch, then creates the new branch on top of it.</p>'
       + selectField('Base branch', 'setBaseBranch', state.branches, state.baseBranch)
       + '<label>New branch name</label><input data-change="setNewBranch" value="' + esc(state.newBranch) + '">'
       + btn('Pull Latest & Create Branch', 'createBranch')
-      + btn('Change Repository', 'changeRepo', 'secondary')
       + errorBlock();
   }
   function renderReady() {
     return '<h2>Auto Tests</h2>' + connectedLine() + repoLine() + '<hr>'
       + '<p class="ok">✓ Created branch <b>' + esc(state.newBranch) + '</b></p>'
       + '<p class="muted">From latest ' + esc(state.baseBranch) + ' · ' + esc(frameworkText()) + '</p>'
-      + btn('▶ Start Test Generation', 'start')
-      + btn('Change Repository', 'changeRepo', 'secondary')
+      + toolsBlock()
+      + installNote()
+      + gateButton('▶ Start Test Generation', 'start')
       + errorBlock();
   }
   function renderRunning() {
@@ -128,10 +162,10 @@ export function getHtml(cspSource: string): string {
       + '<p class="ok">✓ Completed on <b>' + esc(r.branch) + '</b></p>'
       + '<div class="stat"><span>Files written</span><span>' + r.filesWritten + '</span></div>'
       + '<div class="stat"><span>Files skipped</span><span>' + r.filesSkipped + '</span></div>'
-      + '<div class="stat"><span>Function coverage</span><span>' + r.coverageBefore + '% → ' + r.coverageAfter + '%</span></div>'
+      + '<div class="stat"><span>' + (r.coverageAfter.unit === 'lines' ? 'Line coverage' : 'Function coverage') + '</span><span>' + covText(r.coverageBefore) + ' → ' + covText(r.coverageAfter) + '</span></div>'
+      + '<div class="stat"><span>Files fully covered</span><span>' + r.coverageBefore.filesCovered + '/' + r.coverageBefore.filesTotal + ' → ' + r.coverageAfter.filesCovered + '/' + r.coverageAfter.filesTotal + '</span></div>'
       + btn('View Full Report', 'openReport')
       + btn('Run Again', 'start', 'secondary')
-      + btn('Change Repository', 'changeRepo', 'secondary')
       + '<hr><h2>Files</h2>' + files
       + errorBlock();
   }
@@ -150,6 +184,8 @@ export function getHtml(cspSource: string): string {
   app.addEventListener('click', function (e) {
     var action = e.target.closest('[data-action]');
     if (action && !action.disabled) { send(action.dataset.action); return; }
+    var link = e.target.closest('[data-url]');
+    if (link) { send('openUrl', { value: link.dataset.url }); return; }
     var file = e.target.closest('[data-open]');
     if (file) send('openFile', { value: file.dataset.open });
   });

@@ -1,7 +1,8 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { createBranchFromLatest, defaultBranch, isGitRepo, listBranches, trackedFiles } from './gitOps';
+import { createBranchFromLatest, currentBranch, isGitRepo, listBranches, repoRoot, trackedFiles } from './gitOps';
 import { detectProjects, frameworksFor, rankLanguages } from './detectLanguage';
+import { checkTools } from './preflight';
 import { renderReportMarkdown, runGeneration } from './testRunner';
 import { getHtml } from './webview';
 import { AppState, Progress, Stage, WebviewMessage } from './types';
@@ -17,6 +18,7 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
     frameworks: [],
     detectedFrameworks: [],
     frameworkNeeded: false,
+    tools: [],
     branches: [],
     branchReady: false,
     running: false,
@@ -27,6 +29,8 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
     view.webview.options = { enableScripts: true };
     view.webview.html = getHtml(view.webview.cspSource);
     view.webview.onDidReceiveMessage((msg: WebviewMessage) => this.handle(msg));
+    const folderWatch = vscode.workspace.onDidChangeWorkspaceFolders(() => this.reloadRepo());
+    view.onDidDispose(() => folderWatch.dispose());
     this.post();
   }
 
@@ -37,14 +41,9 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
         case 'connect':
           await this.connect();
           break;
-        case 'selectFolder':
-          await this.selectFolder();
-          break;
-        case 'changeRepo':
-          this.resetRepo();
-          break;
         case 'setLanguage':
           this.applyLanguage(msg.value);
+          await this.refreshTools();
           break;
         case 'setFramework':
           this.state.framework = msg.value;
@@ -54,6 +53,9 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
           break;
         case 'setNewBranch':
           this.state.newBranch = msg.value;
+          break;
+        case 'recheckTools':
+          await this.refreshTools();
           break;
         case 'createBranch':
           await this.createBranch();
@@ -69,6 +71,9 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
           break;
         case 'openFile':
           await this.openFile(msg.value);
+          break;
+        case 'openUrl':
+          await vscode.env.openExternal(vscode.Uri.parse(msg.value));
           break;
       }
     } catch (err) {
@@ -97,40 +102,64 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
       throw new Error('No Copilot model found. Sign in to GitHub Copilot in VS Code, then press Connect again.');
     }
     this.state.model = models[0].name;
+    await this.loadRepo();
   }
 
-  private async selectFolder(): Promise<void> {
+  // Re-reads the repository opened in VS Code when the workspace folders change.
+  private async reloadRepo(): Promise<void> {
+    if (!this.state.model || this.state.running) return;
+    try {
+      await this.loadRepo();
+    } catch (err) {
+      this.state.error = err instanceof Error ? err.message : String(err);
+    }
+    this.post();
+  }
+
+  // The repository is the git repo that holds the first workspace folder opened in VS Code.
+  private async loadRepo(): Promise<void> {
     if (this.state.running) {
       throw new Error('A run is in progress. Wait for it to finish or cancel it first.');
     }
-    const picked = await vscode.window.showOpenDialog({
-      canSelectFiles: false,
-      canSelectFolders: true,
-      canSelectMany: false,
-      openLabel: 'Select repository',
-    });
-    if (!picked?.length) return;
-
-    const repo = picked[0].fsPath;
-    if (!(await isGitRepo(repo))) {
-      throw new Error('The selected folder is not a git repository.');
+    const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!folder) {
+      throw new Error('Open the repository folder in VS Code (File > Open Folder), then press Retry.');
     }
+    if (!(await isGitRepo(folder))) {
+      throw new Error('The opened folder is not a git repository.');
+    }
+    const repo = await repoRoot(folder);
 
     const projects = await detectProjects(repo, await trackedFiles(repo));
     if (projects.length === 0) {
       throw new Error('No supported project found. Supported: Python, TypeScript/JavaScript, Java, C# and Go.');
     }
+    const base = await currentBranch(repo);
+    if (!base) {
+      throw new Error('HEAD is detached. Check out a branch in the opened repository first.');
+    }
     const branches = await listBranches(repo);
-    const remoteDefault = await defaultBranch(repo);
 
     this.resetRepo();
     this.state.repoPath = repo;
     this.state.projects = projects;
     this.state.languages = rankLanguages(projects);
     this.applyLanguage(this.state.languages[0]);
+    await this.refreshTools();
     this.state.branches = branches;
-    this.state.baseBranch = pickBaseBranch(branches, remoteDefault);
+    this.state.baseBranch = branches.includes(base) ? base : branches[0];
     this.state.newBranch = defaultNewBranchName();
+  }
+
+  // Checks the tools the current language needs. Branch creation and generation stay blocked while any are missing.
+  private async refreshTools(): Promise<void> {
+    const { repoPath, language, projects } = this.state;
+    if (!repoPath || !language) return;
+    this.state.tools = await checkTools(repoPath, language, projects.filter(p => p.language === language));
+  }
+
+  private missingTools(): string[] {
+    return this.state.tools.filter(t => !t.ok).map(t => t.name);
   }
 
   // Sets the language and works out the framework. A framework is only asked for when
@@ -162,6 +191,7 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
       detectedFrameworks: [],
       frameworkNeeded: false,
       framework: undefined,
+      tools: [],
       branches: [],
       baseBranch: undefined,
       newBranch: undefined,
@@ -176,6 +206,10 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
     if (!repoPath || !baseBranch || !newBranch) {
       throw new Error('Choose a base branch and enter a new branch name first.');
     }
+    const missing = this.missingTools();
+    if (missing.length > 0) {
+      throw new Error(`Install ${missing.join(', ')}, then press Recheck tools.`);
+    }
     await createBranchFromLatest(repoPath, baseBranch, newBranch);
     this.state.branchReady = true;
   }
@@ -188,6 +222,10 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
     }
     if (frameworkNeeded && !framework) {
       throw new Error('Choose a test framework first.');
+    }
+    const missing = this.missingTools();
+    if (missing.length > 0) {
+      throw new Error(`Install ${missing.join(', ')}, then press Recheck tools.`);
     }
 
     const projects = this.state.projects.filter(p => p.language === language);
@@ -223,11 +261,6 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
     const uri = vscode.Uri.file(path.join(this.state.repoPath, relative));
     await vscode.window.showTextDocument(uri, { preview: false });
   }
-}
-
-function pickBaseBranch(branches: string[], remoteDefault: string | undefined): string | undefined {
-  if (remoteDefault && branches.includes(remoteDefault)) return remoteDefault;
-  return ['develop', 'main', 'master'].find(b => branches.includes(b)) ?? branches[0];
 }
 
 function defaultNewBranchName(): string {
