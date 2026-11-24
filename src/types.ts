@@ -14,27 +14,38 @@ export interface Progress {
 
 export interface FileResult {
   path: string;
-  passed: number;
-  failed: number;
+  status: 'written' | 'skipped';
+  note?: string;
+}
+
+// A folder with its own build or dependency file, e.g. the repo root or a monorepo package.
+export interface Project {
+  language: string;
+  root: string; // repo-relative folder, '' for the repository root
+  hasTests: boolean;
+  sources: number;
+  framework?: string; // detected from the tests that already exist
 }
 
 export interface Report {
   branch: string;
+  projects: string[];
   filesWritten: number;
-  testsPassed: number;
-  testsFailed: number;
+  filesSkipped: number;
   coverageBefore: number;
   coverageAfter: number;
-  skipped: number;
   files: FileResult[];
 }
 
 export interface AppState {
   model?: string;
   repoPath?: string;
+  projects: Project[];
   languages: string[];
   language?: string;
   frameworks: string[];
+  detectedFrameworks: string[];
+  frameworkNeeded: boolean;
   framework?: string;
   branches: string[];
   baseBranch?: string;

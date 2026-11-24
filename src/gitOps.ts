@@ -20,6 +20,12 @@ async function hasOrigin(repo: string): Promise<boolean> {
   return (await git(repo, ['remote'])).split('\n').includes('origin');
 }
 
+// Repo-relative paths of tracked files; ignored and untracked files are left out.
+export async function trackedFiles(repo: string): Promise<string[]> {
+  const out = await git(repo, ['ls-files']);
+  return out ? out.split('\n') : [];
+}
+
 export async function listBranches(repo: string): Promise<string[]> {
   const out = await git(repo, ['for-each-ref', '--format=%(refname:short)', 'refs/heads', 'refs/remotes/origin']);
   const names = out
