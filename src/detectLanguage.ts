@@ -3,12 +3,12 @@ import * as path from 'path';
 import { adapterFor } from './languages/adapters';
 import { Project } from './types';
 
-// Runnable frameworks offered in the dropdown: only those the engine can set up and run automatically.
+// Frameworks offered in the dropdown when a project has no tests. The engine installs the chosen one if it is missing.
 export const FRAMEWORKS: Record<string, string[]> = {
   Python: ['pytest', 'unittest'],
-  'TypeScript/JavaScript': ['Vitest'],
-  Java: ['JUnit 5'],
-  'C#': ['xUnit'],
+  'TypeScript/JavaScript': ['Vitest', 'Jest', 'Mocha'],
+  Java: ['JUnit 5', 'TestNG'],
+  'C#': ['xUnit', 'NUnit', 'MSTest'],
   Go: ['go test'],
 };
 
