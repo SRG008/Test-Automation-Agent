@@ -1,0 +1,48 @@
+{
+  "name": "auto-unit-test-agent",
+  "displayName": "Auto Unit Test Agent",
+  "description": "Generates unit tests in the background on a new branch using your GitHub Copilot.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Testing"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onView:autoTests.panel"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "autoTests",
+          "title": "Auto Tests",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "autoTests": [
+        {
+          "type": "webview",
+          "id": "autoTests.panel",
+          "name": "Auto Tests"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.4.5"
+  }
+}
