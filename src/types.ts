@@ -123,6 +123,10 @@ export interface AppState {
   newBranch?: string;
   branchReady: boolean;
   running: boolean;
+  // Source files of the chosen language, and the ones the user ticked for "Choose files".
+  sourceFiles: string[];
+  selected: string[];
+  choosing: boolean;
   progress?: Progress;
   report?: Report;
   error?: string;
@@ -137,8 +141,12 @@ export type WebviewMessage =
   | { type: 'recheckTools' }
   | { type: 'createBranch' }
   | { type: 'start' }
+  | { type: 'chooseFiles' }
+  | { type: 'backToOptions' }
+  | { type: 'toggleFile'; value: string; checked: boolean }
+  | { type: 'toggleFolder'; value: string; checked: boolean }
+  | { type: 'startSelected' }
   | { type: 'cancel' }
-  | { type: 'openReport' }
   | { type: 'openHtml' }
   | { type: 'savePdf' }
   | { type: 'openFile'; value: string }

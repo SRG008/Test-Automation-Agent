@@ -12,6 +12,8 @@ export interface RunConfig {
   // Framework for projects whose existing tests do not reveal one.
   framework?: string;
   projects: Project[];
+  // Repo-relative source files to write tests for. Undefined means every source file.
+  selected?: string[];
 }
 
 const STEP_LABELS = [
@@ -85,6 +87,22 @@ function ownerOf(roots: string[], repoRel: string): string {
   return roots
     .filter(r => r === '' || repoRel.startsWith(`${r}/`))
     .sort((a, b) => b.length - a.length)[0];
+}
+
+// Every source file of the language that the agent can write tests for, as repo-relative paths.
+export async function listSourceFiles(repoPath: string, projects: Project[], language: string): Promise<string[]> {
+  const adapter = adapterFor(language);
+  const tracked = await trackedFiles(repoPath);
+  const roots = projects.map(p => p.root);
+  const found = new Set<string>();
+  for (const project of projects) {
+    const prefix = project.root ? `${project.root}/` : '';
+    for (const f of tracked) {
+      if (!f.startsWith(prefix)) continue;
+      if (adapter.isSource(f.slice(prefix.length)) && ownerOf(roots, f) === project.root) found.add(f);
+    }
+  }
+  return [...found].sort();
 }
 
 async function measure(job: Job): Promise<Measured> {
@@ -319,6 +337,7 @@ export async function runGeneration(
     ? config.projects
     : [{ language: config.language, root: '', hasTests: false, sources: 0 }];
   const roots = projects.map(p => p.root);
+  const selected = config.selected ? new Set(config.selected) : undefined;
   const runStartedAt = Date.now();
   const steps: StepStatus[] = STEP_LABELS.map((label, i) => ({ label, status: 'pending', estimateSec: STEP_ESTIMATES[i] }));
   let live: LiveStatus | undefined;
@@ -355,7 +374,10 @@ export async function runGeneration(
     const setupError = await adapter.ensureTooling(ctx);
     if (setupError) throw new Error(`${project.root || 'Repository root'}: ${setupError}`);
     const sources = ctx.files.filter(
-      f => adapter.isSource(f) && ownerOf(roots, joinRepo(project.root, f)) === project.root,
+      f =>
+        adapter.isSource(f) &&
+        ownerOf(roots, joinRepo(project.root, f)) === project.root &&
+        (!selected || selected.has(joinRepo(project.root, f))),
     );
     jobs.push({ root: project.root, framework, adapter, ctx, sources });
   }

@@ -13,7 +13,9 @@ export function getHtml(cspSource: string): string {
   h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; margin: 0 0 10px; opacity: .8; }
   p { margin: 6px 0 12px; line-height: 1.45; }
   .btn { display: block; width: 100%; box-sizing: border-box; padding: 6px 10px; margin: 8px 0; border: none; border-radius: 2px; cursor: pointer; text-align: center; font: inherit; background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+  .btn { transition: background .15s ease, transform .08s ease; }
   .btn:hover { background: var(--vscode-button-hoverBackground); }
+  .btn:active:not(:disabled) { transform: scale(.98); }
   .btn.secondary { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
   .btn:disabled { opacity: .5; cursor: default; }
   label { display: block; font-size: 12px; opacity: .85; margin-top: 10px; }
@@ -51,6 +53,27 @@ export function getHtml(cspSource: string): string {
   .stat { display: flex; justify-content: space-between; font-size: 12px; margin: 4px 0; }
   .file { display: flex; justify-content: space-between; width: 100%; background: none; border: none; color: var(--vscode-textLink-foreground); cursor: pointer; padding: 3px 0; font: inherit; font-size: 12px; text-align: left; }
   .file:hover { text-decoration: underline; }
+  .chooser { border: 1px solid var(--vscode-editorWidget-border, #444); border-radius: 4px; padding: 6px 8px; margin: 8px 0; max-height: 320px; overflow-y: auto; }
+  .chooser label { display: flex; align-items: center; gap: 6px; font-size: 12px; margin: 3px 0; cursor: pointer; word-break: break-all; }
+  .chooser { background: var(--vscode-editor-background); }
+  .chooser .indent { margin-left: 16px; }
+  .chooser label { padding: 2px 4px; border-radius: 3px; transition: background .12s ease; }
+  .chooser label:hover { background: var(--vscode-list-hoverBackground); }
+  .chooser input[type=checkbox] { accent-color: #a855f7; margin: 0; cursor: pointer; flex-shrink: 0; }
+  .folder-row { display: flex; align-items: center; gap: 2px; }
+  .folder-row label { flex: 1; min-width: 0; }
+  .chev { display: inline-block; width: 16px; text-align: center; cursor: pointer; user-select: none; opacity: .75; transition: transform .2s ease; }
+  .chev:hover { opacity: 1; }
+  .folder.collapsed > .folder-row .chev { transform: rotate(-90deg); }
+  .folder.collapsed > .indent { display: none; }
+  .chooser-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .chooser-head h2 { margin-bottom: 4px; }
+  .pill { font-size: 11px; padding: 1px 8px; border-radius: 10px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); white-space: nowrap; }
+  .sel-track { height: 4px; border-radius: 2px; overflow: hidden; margin: 6px 0 10px; background: var(--vscode-editorWidget-border, #444); }
+  .sel-fill { height: 100%; width: 0; background: linear-gradient(90deg, #22d3ee, #a855f7, #f472b6); transition: width .3s ease; }
+  #app.anim > * { animation: fadeUp .25s ease-out both; }
+  @keyframes fadeUp { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  @media (prefers-reduced-motion: reduce) { #app.anim > * { animation: none; } .chev, .sel-fill, .btn { transition: none; } }
   hr { border: none; border-top: 1px solid var(--vscode-editorWidget-border, #444); margin: 14px 0; }
 </style>
 </head>
@@ -93,7 +116,7 @@ export function getHtml(cspSource: string): string {
     setLanguage: 'Checking tools…',
     setFramework: 'Checking tools…',
     start: 'Starting test generation…',
-    openReport: 'Opening PDF report…',
+    startSelected: 'Starting test generation…',
     openHtml: 'Opening HTML report…',
     savePdf: 'Saving PDF report…',
   };
@@ -182,10 +205,6 @@ export function getHtml(cspSource: string): string {
       : '';
   }
   // Shows Recheck tools in place of the action while a required tool is missing.
-  function gateButton(label, action) {
-    return missingNames().length ? btn('Recheck tools', 'recheckTools', 'secondary') : btn(label, action);
-  }
-
   function renderConnect() {
     return '<h2>Auto Tests</h2>'
       + '<p>Generate unit tests in the background using your GitHub Copilot.</p>'
@@ -227,13 +246,73 @@ export function getHtml(cspSource: string): string {
       + errorBlock();
   }
   function renderReady() {
-    return '<h2>Auto Tests</h2>' + connectedLine() + repoLine() + '<hr>'
+    var head = '<h2>Auto Tests</h2>' + connectedLine() + repoLine() + '<hr>'
       + '<p class="ok">✓ Created branch <b>' + esc(state.newBranch) + '</b></p>'
       + '<p class="muted">From latest ' + esc(state.baseBranch) + ' · ' + esc(frameworkText()) + '</p>'
       + toolsBlock()
-      + installNote()
-      + gateButton('▶ Start Test Generation', 'start')
+      + installNote();
+    if (missingNames().length > 0) return head + btn('Recheck tools', 'recheckTools', 'secondary') + errorBlock();
+    if (state.choosing) return head + renderChooser() + errorBlock();
+    return head
+      + '<p class="muted">Write tests for every source file, or pick the files and folders yourself.</p>'
+      + btn('▶ Create test cases for all files', 'start')
+      + btn('Choose files and folders', 'chooseFiles', 'secondary')
       + errorBlock();
+  }
+
+  // Nested folders with a checkbox each. Ticking a folder ticks every file inside it.
+  function buildTree(paths) {
+    var root = { path: '', folders: {}, files: [] };
+    paths.forEach(function (p) {
+      var parts = p.split('/');
+      var node = root;
+      var acc = '';
+      for (var i = 0; i < parts.length - 1; i++) {
+        acc = acc ? acc + '/' + parts[i] : parts[i];
+        if (!node.folders[parts[i]]) node.folders[parts[i]] = { name: parts[i], path: acc, folders: {}, files: [] };
+        node = node.folders[parts[i]];
+      }
+      node.files.push(p);
+    });
+    return root;
+  }
+  function filesUnder(node) {
+    var out = node.files.slice();
+    Object.keys(node.folders).forEach(function (k) { out = out.concat(filesUnder(node.folders[k])); });
+    return out;
+  }
+  function treeHtml(node, picked) {
+    var html = '';
+    Object.keys(node.folders).sort().forEach(function (k) {
+      var f = node.folders[k];
+      var all = filesUnder(f);
+      var n = all.filter(function (p) { return picked[p]; }).length;
+      html += '<div class="folder' + (collapsed[f.path] ? ' collapsed' : '') + '">'
+        + '<div class="folder-row"><span class="chev" data-collapse="' + esc(f.path) + '">▾</span>'
+        + '<label><input type="checkbox" data-toggle="toggleFolder" data-path="' + esc(f.path) + '"'
+        + (n === all.length ? ' checked' : '')
+        + (n > 0 && n < all.length ? ' data-indeterminate="1"' : '')
+        + '> <b>' + esc(k) + '/</b> <span class="muted">' + all.length + ' files</span></label></div>'
+        + '<div class="indent">' + treeHtml(f, picked) + '</div></div>';
+    });
+    node.files.slice().sort().forEach(function (p) {
+      html += '<label><input type="checkbox" data-toggle="toggleFile" data-path="' + esc(p) + '"'
+        + (picked[p] ? ' checked' : '') + '> ' + esc(p.split('/').pop()) + '</label>';
+    });
+    return html;
+  }
+  function renderChooser() {
+    var picked = {};
+    (state.selected || []).forEach(function (p) { picked[p] = true; });
+    var total = (state.sourceFiles || []).length;
+    var count = (state.selected || []).length;
+    if (total === 0) return '<p class="muted">No source files found for ' + esc(state.language) + '.</p>' + btn('Back', 'backToOptions', 'secondary');
+    var percent = Math.round(count * 100 / total);
+    return '<div class="chooser-head"><h2>Choose files</h2><span class="pill">' + count + ' / ' + total + '</span></div>'
+      + '<div class="sel-track"><div class="sel-fill" style="width:' + percent + '%"></div></div>'
+      + '<div class="chooser">' + treeHtml(buildTree(state.sourceFiles), picked) + '</div>'
+      + (count ? btn('▶ Generate tests for ' + count + ' selected', 'startSelected') : '<p class="muted">Tick a file or folder to enable generation.</p>')
+      + btn('Back', 'backToOptions', 'secondary');
   }
   function renderRunning() {
     var p = state.progress || { steps: [], done: 0, total: 1, startedAt: Date.now() };
@@ -283,7 +362,6 @@ export function getHtml(cspSource: string): string {
       + '<div class="stat"><span>Files skipped</span><span>' + r.filesSkipped + '</span></div>'
       + '<div class="stat"><span>' + (r.coverageAfter.unit === 'lines' ? 'Line coverage' : 'Function coverage') + '</span><span>' + covText(r.coverageBefore) + ' → ' + covText(r.coverageAfter) + '</span></div>'
       + '<div class="stat"><span>Files fully covered</span><span>' + r.coverageBefore.filesCovered + '/' + r.coverageBefore.filesTotal + ' → ' + r.coverageAfter.filesCovered + '/' + r.coverageAfter.filesTotal + '</span></div>'
-      + btn('View PDF Report', 'openReport')
       + btn('View HTML Report', 'openHtml', 'secondary')
       + btn('Save PDF…', 'savePdf', 'secondary')
       + btn('Run Again', 'start', 'secondary')
@@ -291,9 +369,20 @@ export function getHtml(cspSource: string): string {
       + errorBlock();
   }
 
+  var collapsed = {};
+  var lastScreen = '';
   function render() {
     var views = { connect: renderConnect, repo: renderRepo, branch: renderBranch, ready: renderReady, running: renderRunning, done: renderDone };
+    // Fade in only when the screen changes, so re-renders on each tick don't replay the animation.
+    var screen = state.stage + ':' + !!state.choosing;
+    if (screen !== lastScreen) {
+      lastScreen = screen;
+      app.classList.add('anim');
+      clearTimeout(app.animTimer);
+      app.animTimer = setTimeout(function () { app.classList.remove('anim'); }, 300);
+    }
     app.innerHTML = (views[state.stage] || renderConnect)();
+    app.querySelectorAll('input[data-indeterminate]').forEach(function (el) { el.indeterminate = true; });
     updateTimers();
   }
 
@@ -305,6 +394,13 @@ export function getHtml(cspSource: string): string {
     }
   });
   app.addEventListener('click', function (e) {
+    var chev = e.target.closest('[data-collapse]');
+    if (chev) {
+      var path = chev.dataset.collapse;
+      collapsed[path] = !collapsed[path];
+      chev.closest('.folder').classList.toggle('collapsed', !!collapsed[path]);
+      return;
+    }
     var action = e.target.closest('[data-action]');
     if (action && !action.disabled) { showBusy(action.dataset.action); send(action.dataset.action); return; }
     var link = e.target.closest('[data-url]');
@@ -314,6 +410,7 @@ export function getHtml(cspSource: string): string {
   });
   app.addEventListener('change', function (e) {
     var t = e.target;
+    if (t.dataset && t.dataset.toggle) { send(t.dataset.toggle, { value: t.dataset.path, checked: t.checked }); return; }
     if (t.dataset && t.dataset.change) { showBusy(t.dataset.change); send(t.dataset.change, { value: t.value }); }
   });
 </script>

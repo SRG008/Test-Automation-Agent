@@ -5,7 +5,7 @@ import * as vscode from 'vscode';
 import { createBranchFromLatest, currentBranch, isGitRepo, listBranches, repoRoot, trackedFiles } from './gitOps';
 import { detectProjects, frameworksFor, rankLanguages } from './detectLanguage';
 import { checkTools } from './preflight';
-import { runGeneration } from './testRunner';
+import { listSourceFiles, runGeneration } from './testRunner';
 import { writeReportFiles } from './reportHtml';
 import { getHtml } from './webview';
 import { AppState, Progress, Stage, ToolCheck, WebviewMessage } from './types';
@@ -28,6 +28,9 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
     branches: [],
     branchReady: false,
     running: false,
+    sourceFiles: [],
+    selected: [],
+    choosing: false,
   };
 
   constructor(storageDir: string) {
@@ -54,6 +57,7 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
           break;
         case 'setLanguage':
           this.applyLanguage(msg.value);
+          await this.refreshSources();
           await this.refreshTools();
           break;
         case 'setFramework':
@@ -73,13 +77,25 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
           await this.createBranch();
           break;
         case 'start':
-          await this.start();
+          await this.start(false);
+          break;
+        case 'chooseFiles':
+          this.state.choosing = true;
+          break;
+        case 'backToOptions':
+          this.state.choosing = false;
+          break;
+        case 'toggleFile':
+          this.setSelected([msg.value], msg.checked);
+          break;
+        case 'toggleFolder':
+          this.setSelected(this.filesIn(msg.value), msg.checked);
+          break;
+        case 'startSelected':
+          await this.start(true);
           break;
         case 'cancel':
           this.cancelRequested = true;
-          break;
-        case 'openReport':
-          await this.openReport();
           break;
         case 'openHtml':
           await this.openHtml();
@@ -163,6 +179,7 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
     this.state.projects = projects;
     this.state.languages = rankLanguages(projects);
     this.applyLanguage(this.state.languages[0]);
+    await this.refreshSources();
     await this.refreshTools();
     this.state.branches = branches;
     this.state.baseBranch = branches.includes(base) ? base : branches[0];
@@ -178,6 +195,30 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
 
   private missingTools(): ToolCheck[] {
     return this.state.tools.filter(t => t.required && !t.ok);
+  }
+
+  // Lists the source files of the chosen language. A new list clears any earlier selection.
+  private async refreshSources(): Promise<void> {
+    const { repoPath, language, projects } = this.state;
+    this.state.selected = [];
+    this.state.choosing = false;
+    this.state.sourceFiles = repoPath && language
+      ? await listSourceFiles(repoPath, projects.filter(p => p.language === language), language)
+      : [];
+  }
+
+  // A folder value is a repo-relative path, or '' for the whole repository.
+  private filesIn(folder: string): string[] {
+    return this.state.sourceFiles.filter(f => folder === '' || f.startsWith(`${folder}/`));
+  }
+
+  private setSelected(files: string[], checked: boolean): void {
+    const current = new Set(this.state.selected);
+    for (const f of files) {
+      if (checked) current.add(f);
+      else current.delete(f);
+    }
+    this.state.selected = this.state.sourceFiles.filter(f => current.has(f));
   }
 
   // Tells the user what to install, with the same steps the checklist shows.
@@ -221,6 +262,9 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
       branchReady: false,
       report: undefined,
       progress: undefined,
+      sourceFiles: [],
+      selected: [],
+      choosing: false,
     };
   }
 
@@ -237,7 +281,7 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
     this.state.branchReady = true;
   }
 
-  private async start(): Promise<void> {
+  private async start(selectedOnly: boolean): Promise<void> {
     const { repoPath, newBranch, language, framework, frameworkNeeded, branchReady, running } = this.state;
     if (running) return;
     if (!repoPath || !newBranch || !language || !branchReady) {
@@ -245,6 +289,10 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
     }
     if (frameworkNeeded && !framework) {
       throw new Error('Choose a test framework first.');
+    }
+    const selected = selectedOnly ? [...this.state.selected] : undefined;
+    if (selected && selected.length === 0) {
+      throw new Error('Tick at least one file or folder first.');
     }
     const missing = this.missingTools();
     if (missing.length > 0) {
@@ -258,7 +306,8 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
     this.post();
     try {
       this.state.report = await runGeneration(
-        { repoPath, branch: newBranch, language, framework, projects },
+        { repoPath, branch: newBranch, language, framework, projects, selected },
+
         (progress: Progress) => {
           this.state.progress = progress;
           this.post();
@@ -270,11 +319,6 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
     } finally {
       this.state.running = false;
     }
-  }
-
-  private async openReport(): Promise<void> {
-    if (!this.state.report) return;
-    await vscode.env.openExternal(vscode.Uri.file(this.reportFile));
   }
 
   private async openHtml(): Promise<void> {
