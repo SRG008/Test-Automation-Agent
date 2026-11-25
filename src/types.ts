@@ -7,11 +7,20 @@ export interface StepStatus {
   startedAt?: number; // epoch ms when the step became active
 }
 
+// The source file being handled right now, shown as "file X of Y".
+export interface LiveStatus {
+  index: number; // 1-based position in the plan
+  total: number;
+  file: string; // source file being covered
+  phase: string; // e.g. "Asking Copilot for tests", "Running tests"
+  tests: string[]; // test names in the latest generated test file
+}
+
 export interface Progress {
   steps: StepStatus[];
   done: number;
   total: number;
-  current?: string;
+  live?: LiveStatus;
   startedAt: number; // epoch ms when the run started
 }
 
@@ -30,11 +39,20 @@ export interface Project {
   framework?: string; // detected from the tests that already exist
 }
 
+export interface Counts {
+  covered: number;
+  total: number;
+}
+
 // Line coverage of one source file: how many executable lines it has and which of them no test runs.
+// branches and methods are set only when the language's coverage tool reports them.
 export interface FileCoverage {
   rel: string;
   executable: number;
+  covered: number[];
   uncovered: number[];
+  branches?: Counts;
+  methods?: Counts;
 }
 
 // 'functions' is the name-based fallback used when a language has no coverage tool wired up.
@@ -44,6 +62,8 @@ export interface CoverageSummary {
   total: number;
   filesCovered: number; // source files with no uncovered lines
   filesTotal: number;
+  branches?: Counts; // present only when every measured project reports branches
+  methods?: Counts; // present only when every measured project reports methods
 }
 
 // Covered and total for one source file. total is undefined when the file has no coverage data.
@@ -68,6 +88,8 @@ export interface Report {
   coverageBefore: CoverageSummary;
   coverageAfter: CoverageSummary;
   fileCoverage: FileCoverageRow[];
+  // Line-level coverage of each measured file, after the run. Files without line data are missing here.
+  coverageFiles: FileCoverage[];
   files: FileResult[];
   // Names of the test cases in each written test file.
   testCases: Array<{ path: string; names: string[] }>;
@@ -117,6 +139,7 @@ export type WebviewMessage =
   | { type: 'start' }
   | { type: 'cancel' }
   | { type: 'openReport' }
+  | { type: 'openHtml' }
   | { type: 'savePdf' }
   | { type: 'openFile'; value: string }
   | { type: 'openUrl'; value: string };

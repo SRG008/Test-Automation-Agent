@@ -43,6 +43,11 @@ export function getHtml(cspSource: string): string {
   @keyframes sweep { from { transform: translateX(-100%); } to { transform: translateX(260%); } }
   .busy-text { font-size: 13px; font-weight: 600; color: var(--vscode-foreground); }
   .step { margin: 5px 0; }
+  .now { border: 1px solid var(--vscode-editorWidget-border, #444); border-left: 3px solid #a855f7; border-radius: 4px; padding: 6px 8px; margin: 8px 0; font-size: 12px; }
+  .now-head { font-weight: 600; }
+  .now-file { word-break: break-all; margin: 2px 0 4px; }
+  .tests { margin: 4px 0 0; padding-left: 16px; }
+  .tests li { margin: 2px 0; word-break: break-word; }
   .stat { display: flex; justify-content: space-between; font-size: 12px; margin: 4px 0; }
   .file { display: flex; justify-content: space-between; width: 100%; background: none; border: none; color: var(--vscode-textLink-foreground); cursor: pointer; padding: 3px 0; font: inherit; font-size: 12px; text-align: left; }
   .file:hover { text-decoration: underline; }
@@ -89,6 +94,7 @@ export function getHtml(cspSource: string): string {
     setFramework: 'Checking tools…',
     start: 'Starting test generation…',
     openReport: 'Opening PDF report…',
+    openHtml: 'Opening HTML report…',
     savePdf: 'Saving PDF report…',
   };
   function showBusy(action) {
@@ -236,11 +242,27 @@ export function getHtml(cspSource: string): string {
       var icon = s.status === 'done' ? '<span class="ok">✓</span>' : (s.status === 'active' ? '<span class="spinner"></span>' : '○');
       return '<div class="step">' + icon + ' ' + esc(s.label) + '</div>';
     }).join('');
+    var live = p.live;
+    var LIST_LIMIT = 12;
+    var liveBlock = '';
+    if (live) {
+      var shown = live.tests.slice(0, LIST_LIMIT).map(function (t) { return '<li>' + esc(t) + '</li>'; }).join('');
+      var more = live.tests.length > LIST_LIMIT ? '<li class="muted">+' + (live.tests.length - LIST_LIMIT) + ' more</li>' : '';
+      liveBlock = '<div class="now">'
+        + '<div class="now-head">Covering file ' + live.index + ' of ' + live.total + '</div>'
+        + '<div class="now-file">' + esc(live.file) + '</div>'
+        + '<div class="muted"><span class="spinner"></span> ' + esc(live.phase) + '</div>'
+        + (live.tests.length
+          ? '<div class="muted">Test cases in this file: ' + live.tests.length + '</div><ul class="tests">' + shown + more + '</ul>'
+          : '')
+        + '</div>';
+    }
     return '<h2>Running in background</h2>'
       + '<p class="muted">Branch: ' + esc(state.newBranch) + '</p>'
       + '<div class="track"><div class="fill" style="width:' + pct + '%"></div></div>'
       + '<p class="muted">' + pct + '% complete</p>'
       + '<div class="timing">Elapsed: <b id="elapsed">0s</b><br>Estimated time left: <b id="eta">…</b></div>'
+      + liveBlock
       + steps
       + btn('Cancel', 'cancel', 'secondary')
       + errorBlock();
@@ -262,6 +284,7 @@ export function getHtml(cspSource: string): string {
       + '<div class="stat"><span>' + (r.coverageAfter.unit === 'lines' ? 'Line coverage' : 'Function coverage') + '</span><span>' + covText(r.coverageBefore) + ' → ' + covText(r.coverageAfter) + '</span></div>'
       + '<div class="stat"><span>Files fully covered</span><span>' + r.coverageBefore.filesCovered + '/' + r.coverageBefore.filesTotal + ' → ' + r.coverageAfter.filesCovered + '/' + r.coverageAfter.filesTotal + '</span></div>'
       + btn('View PDF Report', 'openReport')
+      + btn('View HTML Report', 'openHtml', 'secondary')
       + btn('Save PDF…', 'savePdf', 'secondary')
       + btn('Run Again', 'start', 'secondary')
       + '<hr><h2>Files</h2>' + files

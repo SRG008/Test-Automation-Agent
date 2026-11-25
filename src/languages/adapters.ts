@@ -138,17 +138,31 @@ const python: LanguageAdapter = {
       const env = { COVERAGE_FILE: path.join(dir, '.coverage') };
       const testArgs = ctx.framework === 'unittest' ? ['unittest', 'discover'] : ['pytest', '-q'];
       // Failing tests still leave coverage data behind, so the run's exit code is not checked here.
-      await runCommand(py, ['-m', 'coverage', 'run', '--source=.', '-m', ...testArgs], ctx.repo, 600_000, env);
+      await runCommand(py, ['-m', 'coverage', 'run', '--branch', '--source=.', '-m', ...testArgs], ctx.repo, 600_000, env);
       const out = path.join(dir, 'coverage.json');
       const report = await runCommand(py, ['-m', 'coverage', 'json', '-o', out], ctx.repo, 300_000, env);
       if (report.code !== 0) throw new Error(`Could not read Python coverage:\n${report.output}`);
       const data = JSON.parse(await fs.readFile(out, 'utf8')) as {
-        files: Record<string, { missing_lines: number[]; summary: { num_statements: number } }>;
+        files: Record<
+          string,
+          {
+            executed_lines: number[];
+            missing_lines: number[];
+            summary: { num_statements: number; num_branches?: number; covered_branches?: number };
+          }
+        >;
       };
       return Object.entries(data.files).map(([file, f]) => ({
-        rel: toPosix(file),
+        // coverage.py reports absolute paths when --source is used, so they are made repo-relative.
+        rel: toPosix(path.isAbsolute(file) ? path.relative(ctx.repo, file) : file),
         executable: f.summary.num_statements,
+        covered: f.executed_lines,
         uncovered: f.missing_lines,
+        // coverage.py has no method counts, so methods stay unmeasured for Python.
+        branches:
+          f.summary.num_branches === undefined
+            ? undefined
+            : { covered: f.summary.covered_branches ?? 0, total: f.summary.num_branches },
       }));
     });
   },
@@ -312,6 +326,9 @@ interface IstanbulFile {
   path?: string;
   statementMap: Record<string, { start: { line: number } }>;
   s: Record<string, number>;
+  // Branch hit counts per branch id, and function hit counts per function id. Absent in some reporters.
+  b?: Record<string, number[]>;
+  f?: Record<string, number>;
 }
 
 // A line counts as covered when any statement that starts on it ran.
@@ -322,13 +339,19 @@ function istanbulFiles(repo: string, data: Record<string, IstanbulFile>): FileCo
       const line = loc.start.line;
       covered.set(line, (covered.get(line) ?? false) || file.s[id] > 0);
     }
+    const branchHits = Object.values(file.b ?? {}).flat();
+    const fnHits = Object.values(file.f ?? {});
     return {
       rel: toPosix(path.relative(repo, file.path ?? key)),
       executable: covered.size,
+      covered: [...covered].filter(([, hit]) => hit).map(([line]) => line).sort((a, b) => a - b),
       uncovered: [...covered].filter(([, hit]) => !hit).map(([line]) => line).sort((a, b) => a - b),
+      branches: file.b ? { covered: branchHits.filter(n => n > 0).length, total: branchHits.length } : undefined,
+      methods: file.f ? { covered: fnHits.filter(n => n > 0).length, total: fnHits.length } : undefined,
     };
   });
 }
+
 
 
 // ---------- Go (go test) ----------
@@ -377,6 +400,7 @@ function goProfileFiles(text: string, modulePath: string): FileCoverage[] {
   return [...files].map(([rel, lines]) => ({
     rel,
     executable: lines.size,
+    covered: [...lines].filter(([, hit]) => hit).map(([line]) => line).sort((a, b) => a - b),
     uncovered: [...lines].filter(([, hit]) => !hit).map(([line]) => line).sort((a, b) => a - b),
   }));
 }
@@ -400,12 +424,20 @@ const JAVA_FRAMEWORK: Record<string, { maven: string; gradle: string; gradleTask
   },
 };
 
+// Character ranges covered by the given XML tags, so edits can skip nested blocks.
+function tagRanges(xml: string, tags: string[]): [number, number][] {
+  const pattern = new RegExp(`<(${tags.join('|')})>[\\s\\S]*?<\\/\\1>`, 'g');
+  return [...xml.matchAll(pattern)].map(m => [m.index ?? 0, (m.index ?? 0) + m[0].length]);
+}
+
+const inRanges = (ranges: [number, number][], i: number): boolean => ranges.some(([start, end]) => i >= start && i < end);
+
 // Adds the dependency to the top-level <dependencies> block, skipping the ones inside dependencyManagement, build, profiles and reporting.
 function addMavenDependency(pom: string, dep: string): string {
-  const skipped = [...pom.matchAll(/<(dependencyManagement|build|profiles|reporting)>[\s\S]*?<\/\1>/g)].map(m => [m.index ?? 0, (m.index ?? 0) + m[0].length]);
+  const skipped = tagRanges(pom, ['dependencyManagement', 'build', 'profiles', 'reporting']);
   const closer = [...pom.matchAll(/<\/dependencies>/g)]
     .map(m => m.index ?? 0)
-    .find(i => !skipped.some(([start, end]) => i >= start && i < end));
+    .find(i => !inRanges(skipped, i));
   if (closer !== undefined) return `${pom.slice(0, closer)}    ${dep}\n  ${pom.slice(closer)}`;
   const end = pom.lastIndexOf('</project>');
   if (end < 0) throw new Error('pom.xml has no </project> element.');
@@ -417,6 +449,125 @@ function addGradleDependency(build: string, framework: string, kotlin: boolean):
   const dep = kotlin ? `testImplementation("${entry.gradle}")` : `testImplementation '${entry.gradle}'`;
   const task = kotlin ? `tasks.test {\n    ${entry.gradleTask}\n}` : `test {\n    ${entry.gradleTask}\n}`;
   return `${build}\ndependencies {\n    ${dep}\n}\n\n${task}\n`;
+}
+
+const JACOCO_VERSION = '0.8.12';
+
+// Adds JaCoCo to the top-level build plugins: prepare-agent instruments the tests and report runs after them.
+function addMavenJacoco(pom: string): string {
+  const plugin = `<plugin><groupId>org.jacoco</groupId><artifactId>jacoco-maven-plugin</artifactId><version>${JACOCO_VERSION}</version><executions><execution><id>prepare-agent</id><goals><goal>prepare-agent</goal></goals></execution><execution><id>report</id><phase>test</phase><goals><goal>report</goal></goals></execution></executions></plugin>`;
+  const skipped = tagRanges(pom, ['profiles', 'reporting']);
+  const build = [...pom.matchAll(/<build>([\s\S]*?)<\/build>/g)].find(m => !inRanges(skipped, m.index ?? 0));
+  if (!build) {
+    const end = pom.lastIndexOf('</project>');
+    if (end < 0) throw new Error('pom.xml has no </project> element.');
+    return `${pom.slice(0, end)}  <build>\n    <plugins>${plugin}</plugins>\n  </build>\n${pom.slice(end)}`;
+  }
+  const start = build.index ?? 0;
+  const bodyStart = start + '<build>'.length;
+  const managed = tagRanges(build[1], ['pluginManagement']);
+  const close = [...build[1].matchAll(/<\/plugins>/g)].map(m => m.index ?? 0).find(i => !inRanges(managed, i));
+  if (close !== undefined) {
+    const at = bodyStart + close;
+    return `${pom.slice(0, at)}${plugin}${pom.slice(at)}`;
+  }
+  const at = start + build[0].length - '</build>'.length;
+  return `${pom.slice(0, at)}<plugins>${plugin}</plugins>\n  ${pom.slice(at)}`;
+}
+
+// Gradle init script: applies JaCoCo to each Java project and writes its XML report to the folder in AUTOTEST_COV. Failing tests don't stop the report.
+const GRADLE_JACOCO_INIT = `allprojects {
+  plugins.withId('java') {
+    apply plugin: 'jacoco'
+    tasks.withType(Test).configureEach {
+      ignoreFailures = true
+    }
+    tasks.withType(JacocoReport).configureEach {
+      reports {
+        xml.required = true
+        html.required = false
+        csv.required = false
+      }
+      reports.xml.outputLocation = file(System.getenv('AUTOTEST_COV') + '/' + project.path.replace(':', '_') + '.xml')
+    }
+  }
+}
+`;
+
+// The repo's wrapper when it has one, otherwise the tool on PATH.
+function buildTool(ctx: AdapterContext, wrapper: string, tool: string): string {
+  if (!ctx.files.includes(wrapper)) return tool;
+  return process.platform === 'win32' ? wrapper : `./${wrapper}`;
+}
+
+const fileExists = (p: string): Promise<boolean> => fs.access(p).then(() => true, () => false);
+
+interface JavaLine { mi: number; ci: number; cb: number; mb: number }
+interface JavaFileData { lines: Map<number, JavaLine>; methods: Map<string, boolean> }
+
+const xmlAttr = (attrs: string, name: string): string | undefined => new RegExp(`\\b${name}="([^"]*)"`).exec(attrs)?.[1];
+
+// Reads one JaCoCo XML report into the per-file data. Source files are matched to src/main/java paths in the repo.
+function readJacoco(xml: string, ctx: AdapterContext, files: Map<string, JavaFileData>): void {
+  const dataFor = (rel: string): JavaFileData => {
+    let data = files.get(rel);
+    if (!data) {
+      data = { lines: new Map(), methods: new Map() };
+      files.set(rel, data);
+    }
+    return data;
+  };
+  for (const pkg of xml.matchAll(/<package\b([^>]*)(?<!\/)>([\s\S]*?)<\/package>/g)) {
+    const pkgName = xmlAttr(pkg[1], 'name') ?? '';
+    const relOf = (file: string): string | undefined => {
+      const key = pkgName ? `${pkgName}/${file}` : file;
+      return ctx.files.find(f => f === `src/main/java/${key}`);
+    };
+    for (const src of pkg[2].matchAll(/<sourcefile\b([^>]*)(?<!\/)>([\s\S]*?)<\/sourcefile>/g)) {
+      const rel = relOf(xmlAttr(src[1], 'name') ?? '');
+      if (!rel) continue;
+      const lines = dataFor(rel).lines;
+      for (const tag of src[2].matchAll(/<line\b([^>]*)>/g)) {
+        const a = tag[1];
+        lines.set(Number(xmlAttr(a, 'nr')), {
+          mi: Number(xmlAttr(a, 'mi')),
+          ci: Number(xmlAttr(a, 'ci')),
+          cb: Number(xmlAttr(a, 'cb')),
+          mb: Number(xmlAttr(a, 'mb')),
+        });
+      }
+    }
+    for (const cls of pkg[2].matchAll(/<class\b([^>]*)(?<!\/)>([\s\S]*?)<\/class>/g)) {
+      const rel = relOf(xmlAttr(cls[1], 'sourcefilename') ?? '');
+      if (!rel) continue;
+      const methods = dataFor(rel).methods;
+      const className = xmlAttr(cls[1], 'name') ?? '';
+      for (const m of cls[2].matchAll(/<method\b([^>]*)>([\s\S]*?)<\/method>/g)) {
+        const key = `${className}|${xmlAttr(m[1], 'name') ?? ''}${xmlAttr(m[1], 'desc') ?? ''}`;
+        const lineCounter = /<counter type="LINE" missed="\d+" covered="(\d+)"/.exec(m[2]);
+        methods.set(key, (methods.get(key) ?? false) || Number(lineCounter?.[1] ?? 0) > 0);
+      }
+    }
+  }
+}
+
+function javaFileCoverage(files: Map<string, JavaFileData>): FileCoverage[] {
+  const sorted = (lines: number[]): number[] => lines.sort((a, b) => a - b);
+  return [...files]
+    .filter(([, data]) => data.lines.size > 0)
+    .map(([rel, data]) => {
+      const executable = [...data.lines].filter(([, l]) => l.mi + l.ci > 0);
+      const lines = [...data.lines.values()];
+      const methodHits = [...data.methods.values()];
+      return {
+        rel,
+        executable: executable.length,
+        covered: sorted(executable.filter(([, l]) => l.ci > 0).map(([n]) => n)),
+        uncovered: sorted(executable.filter(([, l]) => l.ci === 0).map(([n]) => n)),
+        branches: { covered: lines.reduce((sum, l) => sum + l.cb, 0), total: lines.reduce((sum, l) => sum + l.cb + l.mb, 0) },
+        methods: { covered: methodHits.filter(Boolean).length, total: methodHits.length },
+      };
+    });
 }
 
 const java: LanguageAdapter = {
@@ -438,24 +589,55 @@ const java: LanguageAdapter = {
     const entry = JAVA_FRAMEWORK[ctx.framework];
     if (!entry) return `${ctx.framework} is not supported for Java yet.`;
     const text = await fs.readFile(path.join(ctx.repo, build), 'utf8');
-    if (entry.probe.test(text)) return undefined;
-    const updated =
-      build === 'pom.xml'
-        ? addMavenDependency(text, entry.maven)
-        : addGradleDependency(text, ctx.framework, build.endsWith('.kts'));
-    await fs.writeFile(path.join(ctx.repo, build), updated, 'utf8');
+    let updated = text;
+    if (!entry.probe.test(updated)) {
+      updated =
+        build === 'pom.xml'
+          ? addMavenDependency(updated, entry.maven)
+          : addGradleDependency(updated, ctx.framework, build.endsWith('.kts'));
+    }
+    if (build === 'pom.xml' && !updated.includes('jacoco-maven-plugin')) updated = addMavenJacoco(updated);
+    if (updated !== text) await fs.writeFile(path.join(ctx.repo, build), updated, 'utf8');
     return undefined;
   },
   runTests(ctx, testRel) {
     const className = stemOf(testRel);
-    if (ctx.files.includes('pom.xml')) {
-      const mvnWrapper = process.platform === 'win32' ? 'mvnw' : './mvnw';
-      const mvn = ctx.files.includes('mvnw') ? mvnWrapper : 'mvn';
-      return runCommand(mvn, [`-Dtest=${className}`, 'test'], ctx.repo);
-    }
-    const wrapper = process.platform === 'win32' ? 'gradlew' : './gradlew';
-    const gradle = ctx.files.includes('gradlew') ? wrapper : 'gradle';
-    return runCommand(gradle, ['test', '--tests', className], ctx.repo);
+    if (ctx.files.includes('pom.xml')) return runCommand(buildTool(ctx, 'mvnw', 'mvn'), [`-Dtest=${className}`, 'test'], ctx.repo);
+    return runCommand(buildTool(ctx, 'gradlew', 'gradle'), ['test', '--tests', className], ctx.repo);
+  },
+  async coverage(ctx) {
+    const files = new Map<string, JavaFileData>();
+    const maven = ctx.files.includes('pom.xml');
+    await withScratch(async dir => {
+      let run: CommandResult;
+      let reports: string[] = [];
+      if (maven) {
+        const poms = ctx.files.filter(f => baseOf(f) === 'pom.xml');
+        const outDirs = poms.map(p => path.join(ctx.repo, dirOf(p), 'target', 'site', 'jacoco'));
+        // Remove old reports first, so a build that fails before writing new ones can't be read as current.
+        await Promise.all(outDirs.map(d => fs.rm(d, { recursive: true, force: true })));
+        run = await runCommand(buildTool(ctx, 'mvnw', 'mvn'), ['-Dmaven.test.failure.ignore=true', 'test'], ctx.repo, 600_000);
+        for (const d of outDirs) {
+          const report = path.join(d, 'jacoco.xml');
+          if (await fileExists(report)) reports.push(report);
+        }
+      } else {
+        const init = path.join(dir, 'jacoco-init.gradle');
+        await fs.writeFile(init, GRADLE_JACOCO_INIT, 'utf8');
+        const script = process.platform === 'win32' ? `"${init}"` : init;
+        run = await runCommand(
+          buildTool(ctx, 'gradlew', 'gradle'),
+          ['test', 'jacocoTestReport', '--continue', '--init-script', script],
+          ctx.repo,
+          600_000,
+          { AUTOTEST_COV: dir },
+        );
+        reports = (await fs.readdir(dir)).filter(f => f.endsWith('.xml')).map(f => path.join(dir, f));
+      }
+      if (reports.length === 0) throw new Error(`The build wrote no JaCoCo report:\n${run.output}`);
+      for (const report of reports) readJacoco(await fs.readFile(report, 'utf8'), ctx, files);
+    });
+    return javaFileCoverage(files);
   },
 };
 
@@ -590,6 +772,9 @@ const csharp: LanguageAdapter = {
     // Quoted on Windows because the shell would otherwise split the collector name at its space.
     const collect = process.platform === 'win32' ? '"--collect:XPlat Code Coverage"' : '--collect:XPlat Code Coverage';
     const lines = new Map<string, Map<number, boolean>>();
+    // Per file: branch hits by line (highest seen wins, since reports can repeat a line) and method hits by name and signature.
+    const branchHits = new Map<string, Map<number, [number, number]>>();
+    const methodHits = new Map<string, Map<string, boolean>>();
     for (const proj of projects) {
       await withScratch(async dir => {
         const run = await runCommand('dotnet', ['test', proj, collect, '--results-directory', dir], ctx.repo, 600_000);
@@ -600,21 +785,42 @@ const csharp: LanguageAdapter = {
           for (const cls of xml.matchAll(/<class\b[^>]*\bfilename="([^"]+)"[^>]*>([\s\S]*?)<\/class>/g)) {
             const rel = csRel(ctx.repo, cls[1]);
             const covered = lines.get(rel) ?? new Map<number, boolean>();
+            const branches = branchHits.get(rel) ?? new Map<number, [number, number]>();
+            const methods = methodHits.get(rel) ?? new Map<string, boolean>();
             for (const tag of cls[2].matchAll(/<line\b[^>]*>/g)) {
               const number = Number(/\bnumber="(\d+)"/.exec(tag[0])?.[1]);
               const hits = Number(/\bhits="(\d+)"/.exec(tag[0])?.[1]);
               covered.set(number, (covered.get(number) ?? false) || hits > 0);
+              const cond = /\bcondition-coverage="\d+% \((\d+)\/(\d+)\)"/.exec(tag[0]);
+              if (cond) {
+                const prev = branches.get(number);
+                if (!prev || Number(cond[1]) > prev[0]) branches.set(number, [Number(cond[1]), Number(cond[2])]);
+              }
+            }
+            for (const method of cls[2].matchAll(/<method\b([^>]*)>([\s\S]*?)<\/method>/g)) {
+              const key = `${/\bname="([^"]+)"/.exec(method[1])?.[1] ?? ''}|${/\bsignature="([^"]*)"/.exec(method[1])?.[1] ?? ''}`;
+              const hit = [...method[2].matchAll(/<line\b[^>]*\bhits="(\d+)"/g)].some(m => Number(m[1]) > 0);
+              methods.set(key, (methods.get(key) ?? false) || hit);
             }
             lines.set(rel, covered);
+            branchHits.set(rel, branches);
+            methodHits.set(rel, methods);
           }
         }
       });
     }
-    return [...lines].map(([rel, covered]) => ({
-      rel,
-      executable: covered.size,
-      uncovered: [...covered].filter(([, hit]) => !hit).map(([line]) => line).sort((a, b) => a - b),
-    }));
+    return [...lines].map(([rel, covered]) => {
+      const branches = [...(branchHits.get(rel)?.values() ?? [])];
+      const methods = [...(methodHits.get(rel)?.values() ?? [])];
+      return {
+        rel,
+        executable: covered.size,
+        covered: [...covered].filter(([, hit]) => hit).map(([line]) => line).sort((a, b) => a - b),
+        uncovered: [...covered].filter(([, hit]) => !hit).map(([line]) => line).sort((a, b) => a - b),
+        branches: { covered: branches.reduce((sum, [hit]) => sum + hit, 0), total: branches.reduce((sum, [, all]) => sum + all, 0) },
+        methods: { covered: methods.filter(Boolean).length, total: methods.length },
+      };
+    });
   },
 };
 

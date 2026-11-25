@@ -6,7 +6,7 @@ import { createBranchFromLatest, currentBranch, isGitRepo, listBranches, repoRoo
 import { detectProjects, frameworksFor, rankLanguages } from './detectLanguage';
 import { checkTools } from './preflight';
 import { runGeneration } from './testRunner';
-import { writeReportPdf } from './reportPdf';
+import { writeReportFiles } from './reportHtml';
 import { getHtml } from './webview';
 import { AppState, Progress, Stage, ToolCheck, WebviewMessage } from './types';
 
@@ -15,8 +15,9 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
 
   private view?: vscode.WebviewView;
   private cancelRequested = false;
-  // One fixed file, overwritten by each run, so old reports do not pile up.
+  // One fixed pair of files, overwritten by each run, so old reports do not pile up.
   private readonly reportFile: string;
+  private readonly htmlFile: string;
   private state: AppState = {
     projects: [],
     languages: [],
@@ -31,6 +32,7 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
 
   constructor(storageDir: string) {
     this.reportFile = path.join(storageDir, 'unit-test-report.pdf');
+    this.htmlFile = path.join(storageDir, 'unit-test-report.html');
   }
 
   resolveWebviewView(view: vscode.WebviewView): void {
@@ -78,6 +80,9 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
           break;
         case 'openReport':
           await this.openReport();
+          break;
+        case 'openHtml':
+          await this.openHtml();
           break;
         case 'savePdf':
           await this.savePdf();
@@ -261,7 +266,7 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
         () => this.cancelRequested,
       );
       await fs.mkdir(path.dirname(this.reportFile), { recursive: true });
-      await writeReportPdf(this.state.report, this.reportFile);
+      await writeReportFiles(this.state.report, repoPath, this.htmlFile, this.reportFile);
     } finally {
       this.state.running = false;
     }
@@ -270,6 +275,11 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
   private async openReport(): Promise<void> {
     if (!this.state.report) return;
     await vscode.env.openExternal(vscode.Uri.file(this.reportFile));
+  }
+
+  private async openHtml(): Promise<void> {
+    if (!this.state.report) return;
+    await vscode.env.openExternal(vscode.Uri.file(this.htmlFile));
   }
 
   private async savePdf(): Promise<void> {
