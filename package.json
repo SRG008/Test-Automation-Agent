@@ -2,7 +2,7 @@
   "name": "auto-unit-test-agent",
   "displayName": "Test Automation Agent",
   "description": "Generates unit tests in the background on a new branch using your GitHub Copilot.",
-  "version": "0.1.14",
+  "version": "0.1.16",
   "icon": "media/icon.png",
   "publisher": "local",
   "private": true,
@@ -47,7 +47,11 @@
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
+    "@types/pdfkit": "^0.17.7",
     "@types/vscode": "^1.90.0",
     "typescript": "^5.4.5"
+  },
+  "dependencies": {
+    "pdfkit": "^0.21.0"
   }
 }
