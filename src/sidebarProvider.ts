@@ -3,12 +3,12 @@ import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { createBranchFromLatest, currentBranch, isGitRepo, listBranches, repoRoot, trackedFiles } from './gitOps';
-import { detectProjects, frameworksFor, rankLanguages } from './detectLanguage';
+import { commandForFramework, detectProjects, ownerOf, rankLanguages } from './analysis';
 import { checkTools } from './preflight';
-import { listSourceFiles, runGeneration } from './testRunner';
+import { filesNeedingTests, listSourceFiles, runGeneration } from './testRunner';
 import { writeReportFiles } from './reportHtml';
 import { getHtml } from './webview';
-import { AppState, Progress, Stage, ToolCheck, WebviewMessage } from './types';
+import { AppState, Progress, Project, Stage, ToolCheck, WebviewMessage } from './types';
 
 export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
   static readonly viewType = 'autoTests.panel';
@@ -21,9 +21,6 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
   private state: AppState = {
     projects: [],
     languages: [],
-    frameworks: [],
-    detectedFrameworks: [],
-    frameworkNeeded: false,
     tools: [],
     branches: [],
     branchReady: false,
@@ -56,14 +53,27 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
           await this.connect();
           break;
         case 'setLanguage':
-          this.applyLanguage(msg.value);
+          this.state.language = msg.value;
+          this.state.projectRoot = this.defaultProjectRoot();
           await this.refreshSources();
           await this.refreshTools();
           break;
-        case 'setFramework':
-          this.state.framework = msg.value;
+        case 'setProject': {
+          const chosen = this.languageProjects().find(p => p.root === msg.value);
+          if (!chosen) throw new Error('Choose one of the projects listed for this language.');
+          this.state.projectRoot = chosen.root;
+          await this.refreshSources();
+          break;
+        }
+        case 'setFramework': {
+          const project = this.state.projects.find(p => p.root === msg.root && p.language === this.state.language);
+          if (project && this.state.repoPath) {
+            project.framework = msg.value || undefined;
+            project.testCommand = await commandForFramework(this.state.repoPath, project);
+          }
           await this.refreshTools();
           break;
+        }
         case 'setBaseBranch':
           this.state.baseBranch = msg.value;
           break;
@@ -80,7 +90,7 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
           await this.start(false);
           break;
         case 'chooseFiles':
-          this.state.choosing = true;
+          await this.chooseFiles();
           break;
         case 'backToOptions':
           this.state.choosing = false;
@@ -164,9 +174,10 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
     }
     const repo = await repoRoot(folder);
 
-    const projects = await detectProjects(repo, await trackedFiles(repo));
+    const files = await trackedFiles(repo);
+    const projects = await detectProjects(repo, files);
     if (projects.length === 0) {
-      throw new Error('No supported project found. Supported: Python, TypeScript/JavaScript, Java, C# and Go.');
+      throw new Error('No project found. The repository needs a build or package file, or source code in a recognized language.');
     }
     const base = await currentBranch(repo);
     if (!base) {
@@ -178,7 +189,8 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
     this.state.repoPath = repo;
     this.state.projects = projects;
     this.state.languages = rankLanguages(projects);
-    this.applyLanguage(this.state.languages[0]);
+    this.state.language = this.state.languages[0];
+    this.state.projectRoot = this.defaultProjectRoot();
     await this.refreshSources();
     await this.refreshTools();
     this.state.branches = branches;
@@ -188,28 +200,60 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
 
   // Checks the tools the current language needs. Branch creation and generation stay blocked while any are missing.
   private async refreshTools(): Promise<void> {
-    const { repoPath, language, projects, framework } = this.state;
+    const { repoPath, language, projects } = this.state;
     if (!repoPath || !language) return;
-    this.state.tools = await checkTools(repoPath, language, projects.filter(p => p.language === language), framework);
+    this.state.tools = await checkTools(repoPath, projects.filter(p => p.language === language));
   }
 
   private missingTools(): ToolCheck[] {
     return this.state.tools.filter(t => t.required && !t.ok);
   }
 
-  // Lists the source files of the chosen language. A new list clears any earlier selection.
+  // The projects of the chosen language.
+  private languageProjects(): Project[] {
+    return this.state.projects.filter(p => p.language === this.state.language);
+  }
+
+  // A language with one project uses it straight away. With several, the user picks one.
+  private defaultProjectRoot(): string | undefined {
+    const projects = this.languageProjects();
+    return projects.length === 1 ? projects[0].root : undefined;
+  }
+
+  // Lists the source files of the chosen project. A new list clears any earlier selection.
   private async refreshSources(): Promise<void> {
-    const { repoPath, language, projects } = this.state;
+    const { repoPath, projectRoot } = this.state;
     this.state.selected = [];
     this.state.choosing = false;
-    this.state.sourceFiles = repoPath && language
-      ? await listSourceFiles(repoPath, projects.filter(p => p.language === language), language)
-      : [];
+    if (!repoPath || projectRoot === undefined) {
+      this.state.sourceFiles = [];
+      return;
+    }
+    const all = this.languageProjects();
+    const roots = all.map(p => p.root);
+    const files = await listSourceFiles(repoPath, all);
+    this.state.sourceFiles = files.filter(f => ownerOf(roots, f) === projectRoot);
   }
 
   // A folder value is a repo-relative path, or '' for the whole repository.
   private filesIn(folder: string): string[] {
     return this.state.sourceFiles.filter(f => folder === '' || f.startsWith(`${folder}/`));
+  }
+
+  // Lists the files that still need tests. A project with tests is measured first, so files at 100% coverage are left out.
+  private async chooseFiles(): Promise<void> {
+    const { repoPath, projectRoot } = this.state;
+    const project = this.languageProjects().find(p => p.root === projectRoot);
+    if (!repoPath || !project) throw new Error('Choose a project first.');
+    if (project.hasTests) {
+      const needed = await filesNeedingTests(repoPath, project, this.languageProjects());
+      if (needed.length === 0) {
+        throw new Error('Every source file in this project is already fully covered by its tests. Nothing to write.');
+      }
+      this.state.sourceFiles = needed;
+    }
+    this.state.selected = [];
+    this.state.choosing = true;
   }
 
   private setSelected(files: string[], checked: boolean): void {
@@ -226,21 +270,6 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
     return `Install the tools below first. ${missing.map(t => `${t.name}: ${t.hint}`).join('. ')}.`;
   }
 
-  // Sets the language and works out the framework. A framework is only asked for when
-  // some project of this language has no existing tests to read it from.
-  private applyLanguage(language: string): void {
-    const own = this.state.projects.filter(p => p.language === language);
-    const detected = [...new Set(own.map(p => p.framework).filter((f): f is string => !!f))];
-    const frameworkNeeded = own.some(p => !p.framework);
-    const frameworks = frameworksFor(language);
-
-    this.state.language = language;
-    this.state.frameworks = frameworks;
-    this.state.detectedFrameworks = detected;
-    this.state.frameworkNeeded = frameworkNeeded;
-    this.state.framework = frameworkNeeded ? frameworks[0] : detected[0];
-  }
-
   private resetRepo(): void {
     if (this.state.running) {
       throw new Error('A run is in progress. Cancel it before changing the repository.');
@@ -251,10 +280,7 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
       projects: [],
       languages: [],
       language: undefined,
-      frameworks: [],
-      detectedFrameworks: [],
-      frameworkNeeded: false,
-      framework: undefined,
+      projectRoot: undefined,
       tools: [],
       branches: [],
       baseBranch: undefined,
@@ -282,13 +308,22 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async start(selectedOnly: boolean): Promise<void> {
-    const { repoPath, newBranch, language, framework, frameworkNeeded, branchReady, running } = this.state;
+    const { repoPath, newBranch, language, branchReady, running, projectRoot } = this.state;
     if (running) return;
     if (!repoPath || !newBranch || !language || !branchReady) {
       throw new Error('Create the working branch before starting.');
     }
-    if (frameworkNeeded && !framework) {
-      throw new Error('Choose a test framework first.');
+    const all = this.languageProjects();
+    const project = all.find(p => p.root === projectRoot);
+    if (!project) {
+      throw new Error('Choose the project to write tests for first.');
+    }
+    const label = project.root || 'the repository root';
+    if (!project.framework) {
+      throw new Error(`Choose the test framework for ${label} first.`);
+    }
+    if (!project.testCommand?.trim()) {
+      throw new Error(`Could not work out the test command for ${label}. Choose the framework again.`);
     }
     const selected = selectedOnly ? [...this.state.selected] : undefined;
     if (selected && selected.length === 0) {
@@ -299,14 +334,13 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
       throw new Error(this.missingToolsError(missing));
     }
 
-    const projects = this.state.projects.filter(p => p.language === language);
     this.state.running = true;
     this.state.report = undefined;
     this.cancelRequested = false;
     this.post();
     try {
       this.state.report = await runGeneration(
-        { repoPath, branch: newBranch, language, framework, projects, selected },
+        { repoPath, branch: newBranch, language, projects: [project], allRoots: all.map(p => p.root), selected },
 
         (progress: Progress) => {
           this.state.progress = progress;

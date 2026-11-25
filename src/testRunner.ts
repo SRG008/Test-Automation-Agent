@@ -1,17 +1,20 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { askCopilot, extractCode } from './copilot';
+import { ownerOf } from './analysis';
 import { trackedFiles } from './gitOps';
-import { adapterFor, AdapterContext, LanguageAdapter } from './languages/adapters';
+import { isTestPath } from './languages/conventions';
+import { adapterFor, AdapterContext, LanguageAdapter, pythonEnv, pythonFor } from './languages/adapters';
+import { CommandResult, runCommandLine } from './shell';
 import { CoverageSummary, Counts, FileCount, FileCoverage, FileCoverageRow, FileResult, LiveStatus, Progress, Project, Report, StepStatus } from './types';
 
 export interface RunConfig {
   repoPath: string;
   branch: string;
   language: string;
-  // Framework for projects whose existing tests do not reveal one.
-  framework?: string;
   projects: Project[];
+  // Every project of the language, so a file belongs to its deepest project even when only one is run.
+  allRoots?: string[];
   // Repo-relative source files to write tests for. Undefined means every source file.
   selected?: string[];
 }
@@ -63,7 +66,8 @@ interface Measured extends CoverageSummary {
 // One project being processed. Adapter paths are relative to the project folder (ctx.repo).
 interface Job {
   root: string;
-  framework: string;
+  framework: string; // empty when the existing tests do not reveal one
+  testCommand: string; // runs the project's whole test suite
   adapter: LanguageAdapter;
   ctx: AdapterContext;
   sources: string[];
@@ -82,23 +86,17 @@ const numbered = (source: string): string =>
     .map((line, i) => `${i + 1}: ${line}`)
     .join('\n');
 
-// The deepest project root that contains a file, so a nested project owns its own sources.
-function ownerOf(roots: string[], repoRel: string): string {
-  return roots
-    .filter(r => r === '' || repoRel.startsWith(`${r}/`))
-    .sort((a, b) => b.length - a.length)[0];
-}
-
-// Every source file of the language that the agent can write tests for, as repo-relative paths.
-export async function listSourceFiles(repoPath: string, projects: Project[], language: string): Promise<string[]> {
-  const adapter = adapterFor(language);
+// Every source file that the agent can write tests for, as repo-relative paths. Test files and test folders are left out.
+export async function listSourceFiles(repoPath: string, projects: Project[]): Promise<string[]> {
   const tracked = await trackedFiles(repoPath);
   const roots = projects.map(p => p.root);
+  const knownTests = new Set(projects.flatMap(p => p.testFiles));
   const found = new Set<string>();
   for (const project of projects) {
+    const adapter = adapterFor(project);
     const prefix = project.root ? `${project.root}/` : '';
     for (const f of tracked) {
-      if (!f.startsWith(prefix)) continue;
+      if (!f.startsWith(prefix) || knownTests.has(f) || isTestPath(f)) continue;
       if (adapter.isSource(f.slice(prefix.length)) && ownerOf(roots, f) === project.root) found.add(f);
     }
   }
@@ -106,8 +104,25 @@ export async function listSourceFiles(repoPath: string, projects: Project[], lan
 }
 
 async function measure(job: Job): Promise<Measured> {
+  if (job.adapter.generic) return measureGeneric(job);
   const coverage = job.adapter.coverage ? await job.adapter.coverage(job.ctx) : undefined;
   return coverage ? measureLines(job, coverage) : measureNames(job);
+}
+
+// Languages without a coverage tool: coverage is not available, so a source file is a target only when no test file exists for it yet.
+function measureGeneric(job: Job): Measured {
+  const { adapter, ctx } = job;
+  const result: Measured = { unit: 'none', covered: 0, total: 0, filesCovered: 0, filesTotal: 0, targets: [], files: [] };
+  for (const rel of job.sources) {
+    result.filesTotal++;
+    if (ctx.files.includes(adapter.testPathFor(rel, ctx))) {
+      result.files.push({ rel, covered: 0, missing: 'tests exist, coverage not available' });
+    } else {
+      result.targets.push({ rel, lines: [], functions: [] });
+      result.files.push({ rel, covered: 0, missing: 'no tests yet' });
+    }
+  }
+  return result;
 }
 
 // Real line coverage. Coverage tools leave out files that no test loads, so those are targeted by function name.
@@ -134,7 +149,10 @@ async function measureLines(job: Job, coverage: FileCoverage[]): Promise<Measure
     const file = findCoverage(coverage, rel);
     if (!file) {
       const functions = job.adapter.listFunctions(await read(path.join(job.ctx.repo, rel)));
-      if (functions.length === 0) continue;
+      if (functions.length === 0) {
+        result.files.push({ rel, covered: 0, missing: 'no testable functions' });
+        continue;
+      }
       result.filesTotal++;
       result.targets.push({ rel, lines: [], functions });
       result.files.push({ rel, covered: 0, missing: `no coverage data for: ${functions.join(', ')}` });
@@ -171,7 +189,10 @@ async function measureNames(job: Job): Promise<Measured> {
   const result: Measured = { unit: 'functions', covered: 0, total: 0, filesCovered: 0, filesTotal: 0, targets: [], files: [] };
   for (const rel of job.sources) {
     const functions = adapter.listFunctions(await read(path.join(ctx.repo, rel)));
-    if (functions.length === 0) continue;
+    if (functions.length === 0) {
+      result.files.push({ rel, covered: 0, missing: 'no testable functions' });
+      continue;
+    }
     const missing = functions.filter(fn => {
       const esc = escapeName(fn);
       const pattern = adapter.testRefPattern?.(esc) ?? `(?<![\\w$])${esc}(?![\\w$])`;
@@ -190,10 +211,10 @@ async function measureNames(job: Job): Promise<Measured> {
   return result;
 }
 
-// Adds up every project. The unit is 'lines' only when every project could measure lines.
+// Adds up every project. The unit is 'lines' when projects can measure lines, 'functions' when any falls back to names, and 'none' when no project has a coverage tool.
 async function measureAll(jobs: Job[]): Promise<{ summary: CoverageSummary; targets: Array<{ job: Job; target: Target }>; files: FileMeasure[] }> {
   const summary: CoverageSummary = {
-    unit: 'lines',
+    unit: 'none',
     covered: 0,
     total: 0,
     filesCovered: 0,
@@ -205,7 +226,9 @@ async function measureAll(jobs: Job[]): Promise<{ summary: CoverageSummary; targ
   const files: FileMeasure[] = [];
   for (const job of jobs) {
     const measured = await measure(job);
-    if (measured.unit === 'functions') summary.unit = 'functions';
+    if (measured.unit !== 'none') {
+      summary.unit = measured.unit === 'functions' || summary.unit === 'functions' ? 'functions' : 'lines';
+    }
     summary.covered += measured.covered;
     summary.total += measured.total;
     summary.filesCovered += measured.filesCovered;
@@ -229,10 +252,13 @@ function buildPrompt(adapter: LanguageAdapter, ctx: AdapterContext, target: Targ
   const hasLines = target.lines.length > 0;
   const goal = hasLines
     ? `These lines of the source file are not run by any test yet: ${target.lines.join(', ')}. Write tests so that each of them runs, and assert the behaviour rather than only calling the code. Each source line is prefixed with its line number.`
-    : `This source file has no tests yet. Cover these functions: ${target.functions.join(', ')}.`;
+    : target.functions.length > 0
+      ? `This source file has no tests yet. Cover these functions: ${target.functions.join(', ')}.`
+      : 'This source file has no tests yet. Write tests for its main behaviour.';
   return [
-    `You are writing ${ctx.framework} unit tests for a ${adapter.language} project.`,
+    `You are writing unit tests for a ${adapter.language} project${ctx.framework ? ` with ${ctx.framework}` : ''}.`,
     adapter.testRules(ctx.framework),
+    ctx.styleNote ? `Match how this project already writes its tests: ${ctx.styleNote}` : '',
     `Source file: ${target.rel}`,
     `Test file: ${testRel}`,
     goal,
@@ -256,7 +282,7 @@ function buildPrompt(adapter: LanguageAdapter, ctx: AdapterContext, target: Targ
 
 function buildFixPrompt(adapter: LanguageAdapter, ctx: AdapterContext, target: Target, testRel: string, source: string, testContent: string, output: string): string {
   return [
-    `These ${ctx.framework} tests for a ${adapter.language} project fail.`,
+    `These tests for a ${adapter.language} project${ctx.framework ? ` (${ctx.framework})` : ''} fail.`,
     adapter.testRules(ctx.framework),
     `Source file: ${target.rel}`,
     `Test file: ${testRel}`,
@@ -285,6 +311,7 @@ async function writeAndVerify(
   testRel: string,
   isCancelled: () => boolean,
   setPhase: (phase: string, tests?: string[]) => void,
+  runSuite: () => Promise<CommandResult>,
 ): Promise<FileResult> {
   const abs = path.join(ctx.repo, testRel);
   const original = await fs.readFile(abs, 'utf8').catch(() => undefined);
@@ -300,14 +327,14 @@ async function writeAndVerify(
   setPhase('Asking Copilot for tests');
   let content = extractCode(await askCopilot(buildPrompt(adapter, ctx, target, testRel, source, original)));
   await save(content);
-  let run = await adapter.runTests(ctx, testRel);
+  let run = await runSuite();
 
   for (let attempt = 0; run.code !== 0 && attempt < MAX_FIXES; attempt++) {
     if (isCancelled()) throw new Error('Run cancelled.');
     setPhase(`Fixing failing tests (attempt ${attempt + 1} of ${MAX_FIXES})`);
     content = extractCode(await askCopilot(buildFixPrompt(adapter, ctx, target, testRel, source, content, run.output)));
     await save(content);
-    run = await adapter.runTests(ctx, testRel);
+    run = await runSuite();
   }
 
   if (run.code === 0) {
@@ -327,16 +354,54 @@ async function writeAndVerify(
   };
 }
 
+// Runs the project's own test command over the whole suite, so a new test file must pass alongside the existing tests.
+async function runSuite(job: Job): Promise<CommandResult> {
+  let commandLine = job.testCommand;
+  let env: NodeJS.ProcessEnv | undefined;
+  if (job.adapter.language === 'Python' && /^python\s/.test(commandLine)) {
+    commandLine = `"${await pythonFor(job.ctx.repo)}"${commandLine.slice('python'.length)}`;
+    env = await pythonEnv(job.ctx);
+  }
+  return runCommandLine(commandLine, job.ctx.repo, undefined, env);
+}
+
+// Sets up one project's adapter and source files. Test files are left out, and `selected` limits the sources when the user picked files.
+async function prepareJob(repoPath: string, project: Project, roots: string[], tracked: string[], selected?: Set<string>): Promise<Job> {
+  const adapter = adapterFor(project);
+  const prefix = project.root ? `${project.root}/` : '';
+  const ctx: AdapterContext = {
+    repo: path.join(repoPath, project.root),
+    framework: project.framework ?? '',
+    styleNote: project.styleNote,
+    files: tracked.filter(f => f.startsWith(prefix)).map(f => f.slice(prefix.length)),
+  };
+  const setupError = await adapter.ensureTooling(ctx);
+  if (setupError) throw new Error(`${project.root || 'Repository root'}: ${setupError}`);
+  const sources = ctx.files.filter(
+    f =>
+      adapter.isSource(f) &&
+      ownerOf(roots, joinRepo(project.root, f)) === project.root &&
+      (!selected || selected.has(joinRepo(project.root, f))),
+  );
+  return { root: project.root, framework: ctx.framework, testCommand: project.testCommand?.trim() ?? '', adapter, ctx, sources };
+}
+
+// Source files of a project that still need tests: those with uncovered lines, or none at all. Files at 100% coverage are left out.
+export async function filesNeedingTests(repoPath: string, project: Project, allProjects: Project[]): Promise<string[]> {
+  const tracked = await trackedFiles(repoPath);
+  const job = await prepareJob(repoPath, project, allProjects.map(p => p.root), tracked);
+  const measured = await measure(job);
+  return measured.targets.map(t => joinRepo(project.root, t.rel));
+}
+
 export async function runGeneration(
   config: RunConfig,
   onProgress: (p: Progress) => void,
   isCancelled: () => boolean,
 ): Promise<Report> {
-  const adapter = adapterFor(config.language);
-  const projects = config.projects.length
-    ? config.projects
-    : [{ language: config.language, root: '', hasTests: false, sources: 0 }];
-  const roots = projects.map(p => p.root);
+  const projects = config.projects;
+  if (projects.length === 0) throw new Error('No project to test. Connect to Copilot and reload the repository first.');
+  const roots = config.allRoots ?? projects.map(p => p.root);
   const selected = config.selected ? new Set(config.selected) : undefined;
   const runStartedAt = Date.now();
   const steps: StepStatus[] = STEP_LABELS.map((label, i) => ({ label, status: 'pending', estimateSec: STEP_ESTIMATES[i] }));
@@ -363,23 +428,8 @@ export async function runGeneration(
   const tracked = await trackedFiles(config.repoPath);
   const jobs: Job[] = [];
   for (const project of projects) {
-    const framework = project.framework ?? config.framework;
-    if (!framework) throw new Error('Choose a test framework first.');
-    const prefix = project.root ? `${project.root}/` : '';
-    const ctx: AdapterContext = {
-      repo: path.join(config.repoPath, project.root),
-      framework,
-      files: tracked.filter(f => f.startsWith(prefix)).map(f => f.slice(prefix.length)),
-    };
-    const setupError = await adapter.ensureTooling(ctx);
-    if (setupError) throw new Error(`${project.root || 'Repository root'}: ${setupError}`);
-    const sources = ctx.files.filter(
-      f =>
-        adapter.isSource(f) &&
-        ownerOf(roots, joinRepo(project.root, f)) === project.root &&
-        (!selected || selected.has(joinRepo(project.root, f))),
-    );
-    jobs.push({ root: project.root, framework, adapter, ctx, sources });
+    if (!project.testCommand?.trim()) throw new Error(`${project.root || 'Repository root'}: Enter the test command in the sidebar first.`);
+    jobs.push(await prepareJob(config.repoPath, project, roots, tracked, selected));
   }
   finish(0);
 
@@ -408,7 +458,7 @@ export async function runGeneration(
       onProgress(snapshot(2));
     };
     setPhase('Starting');
-    const result = await writeAndVerify(job.adapter, job.ctx, target, testRel, isCancelled, setPhase);
+    const result = await writeAndVerify(job.adapter, job.ctx, target, testRel, isCancelled, setPhase, () => runSuite(job));
     files.push({ ...result, path: shown });
   }
   live = undefined;
@@ -417,12 +467,6 @@ export async function runGeneration(
   begin(3);
   const after = await measureAll(jobs);
   finish(3);
-
-  const testCases = await Promise.all(
-    files
-      .filter(f => f.status === 'written')
-      .map(async f => ({ path: f.path, names: testCaseNames(await read(path.join(config.repoPath, f.path))) })),
-  );
 
   const beforeByPath = new Map(before.files.map(f => [f.rel, f]));
   const ratio = (c: FileCount): number => (c.total === undefined ? 0 : c.total === 0 ? 1 : c.covered / c.total);
@@ -441,7 +485,7 @@ export async function runGeneration(
   return {
     branch: config.branch,
     generatedAt: new Date().toLocaleString(),
-    projects: jobs.map(j => `${j.root || 'Repository root'} · ${j.adapter.language} · ${j.framework}`),
+    projects: jobs.map(j => [j.root || 'Repository root', j.adapter.language, j.framework].filter(Boolean).join(' · ')),
     filesWritten: files.filter(f => f.status === 'written').length,
     filesSkipped: files.filter(f => f.status === 'skipped').length,
     coverageBefore: before.summary,
@@ -449,7 +493,6 @@ export async function runGeneration(
     fileCoverage,
     coverageFiles: after.files.flatMap(f => (f.lines ? [f.lines] : [])),
     files,
-    testCases,
     remaining: after.targets.map(({ job, target }) => joinRepo(job.root, target.rel)),
   };
 }

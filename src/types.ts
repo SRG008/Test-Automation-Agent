@@ -36,7 +36,13 @@ export interface Project {
   root: string; // repo-relative folder, '' for the repository root
   hasTests: boolean;
   sources: number;
-  framework?: string; // detected from the tests that already exist
+  framework?: string; // detected from the tests that already exist, or chosen in the sidebar
+  frameworkOptions: string[]; // frameworks offered in the sidebar for this language, from Copilot
+  testCommand?: string; // runs this project's test suite, derived from the framework in the background
+  styleNote?: string; // how the existing tests are written, read by Copilot; guides new tests
+  extensions: string[]; // source file extensions of the language, from Copilot, e.g. ".py"
+  buildFiles: string[]; // build, package, and config files, relative to the repository root
+  testFiles: string[]; // existing unit test files, relative to the repository root; may sit outside the project folder
 }
 
 export interface Counts {
@@ -56,8 +62,9 @@ export interface FileCoverage {
 }
 
 // 'functions' is the name-based fallback used when a language has no coverage tool wired up.
+// 'none' means no coverage tool is known for the language, so coverage is reported as not available.
 export interface CoverageSummary {
-  unit: 'lines' | 'functions';
+  unit: 'lines' | 'functions' | 'none';
   covered: number;
   total: number;
   filesCovered: number; // source files with no uncovered lines
@@ -91,8 +98,6 @@ export interface Report {
   // Line-level coverage of each measured file, after the run. Files without line data are missing here.
   coverageFiles: FileCoverage[];
   files: FileResult[];
-  // Names of the test cases in each written test file.
-  testCases: Array<{ path: string; names: string[] }>;
   // Source files that still have uncovered code after the run.
   remaining: string[];
 }
@@ -113,10 +118,8 @@ export interface AppState {
   projects: Project[];
   languages: string[];
   language?: string;
-  frameworks: string[];
-  detectedFrameworks: string[];
-  frameworkNeeded: boolean;
-  framework?: string;
+  // The project the user picked in the sidebar, for the chosen language. Undefined until picked when there are several.
+  projectRoot?: string;
   tools: ToolCheck[];
   branches: string[];
   baseBranch?: string;
@@ -135,7 +138,8 @@ export interface AppState {
 export type WebviewMessage =
   | { type: 'connect' }
   | { type: 'setLanguage'; value: string }
-  | { type: 'setFramework'; value: string }
+  | { type: 'setProject'; value: string }
+  | { type: 'setFramework'; root: string; value: string }
   | { type: 'setBaseBranch'; value: string }
   | { type: 'setNewBranch'; value: string }
   | { type: 'recheckTools' }

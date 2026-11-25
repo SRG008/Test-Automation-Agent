@@ -7,8 +7,6 @@ import { writeReportPdf } from './reportPdf';
 const esc = (text: string): string =>
   text.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] ?? c);
 
-const anchor = (rel: string): string => `f-${rel.replace(/[^A-Za-z0-9]/g, '_')}`;
-
 const STYLE = `
 body{margin:0;font:13px/1.45 "Segoe UI",Arial,sans-serif;color:#1f2937;background:#f3f4f6}
 header{background:#4338ca;color:#fff;padding:18px 28px}
@@ -40,8 +38,11 @@ td.name a:hover{text-decoration:underline}
 td.pctcell{min-width:200px}
 .mini{display:flex;align-items:center;gap:8px}
 .mini .bar{flex:1;margin:0;height:8px}
-.src{margin:18px 0 0}
-.src h3{margin:0 0 4px;font-size:14px;font-family:Consolas,monospace}
+.btn{display:inline-block;background:#fff;color:#4338ca;border-radius:6px;padding:6px 14px;font-weight:600;text-decoration:none;border:1px solid #c7d2fe}
+.btn:hover{background:#eef2ff}
+header .btn{margin-top:12px}
+.file-summary{display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:14px;align-items:center}
+.file-summary .big{font-size:36px}
 pre.code{margin:0;font:12px/1.4 Consolas,"Courier New",monospace;border:1px solid #e5e7eb;border-radius:6px;overflow:auto;background:#fff}
 pre.code div{display:flex;white-space:pre}
 pre.code .ln{width:56px;flex:none;text-align:right;padding:0 10px 0 6px;color:#9ca3af;background:#f9fafb;user-select:none}
@@ -51,11 +52,15 @@ pre.code .unc{background:#fee2e2}
 footer{text-align:center;color:#9ca3af;font-size:12px;padding:12px 0 24px}
 `;
 
-function fileRow(row: FileCoverageRow, linked: Set<string>): string {
+// Maps each file that has a source page to the page's relative href.
+type Links = Map<string, string>;
+
+function fileRow(row: FileCoverageRow, links: Links): string {
   const pct = rowRate(row);
   const tier = tierOf(pct);
   const after = row.after;
-  const name = linked.has(row.path) ? `<a href="#${anchor(row.path)}">${esc(row.path)}</a>` : esc(row.path);
+  const href = links.get(row.path);
+  const name = href ? `<a href="${esc(href)}">${esc(row.path)}</a>` : esc(row.path);
   const covered = after.total === undefined ? '—' : String(after.covered);
   const uncovered = after.total === undefined ? '—' : String(after.total - after.covered);
   const coverable = after.total === undefined ? '—' : String(after.total);
@@ -69,7 +74,7 @@ function fileRow(row: FileCoverageRow, linked: Set<string>): string {
 </tr>`;
 }
 
-function coverageTable(r: Report, linked: Set<string>): string {
+function coverageTable(r: Report, links: Links): string {
   const groups = groupByFolder(r.fileCoverage);
   if (groups.length === 0) return '<p class="muted">No source files were measured.</p>';
   const body = groups
@@ -78,7 +83,7 @@ function coverageTable(r: Report, linked: Set<string>): string {
       const pct = sums.total === 0 ? 100 : (sums.covered / sums.total) * 100;
       const tier = tierOf(sums.total === 0 ? undefined : pct);
       const head = `<tr class="group"><td class="name">${esc(g.folder)}</td><td class="n">${sums.covered}</td><td class="n">${sums.total - sums.covered}</td><td class="n">${sums.total}</td><td class="n"></td><td class="pctcell"><div class="mini"><div class="bar"><span class="fill-${tier}" style="width:${pct}%"></span></div><span class="${tier}">${pctText(pct)}</span></div></td></tr>`;
-      return head + g.rows.map(row => fileRow(row, linked)).join('\n');
+      return head + g.rows.map(row => fileRow(row, links)).join('\n');
     })
     .join('\n');
   return `<table>
@@ -87,18 +92,21 @@ function coverageTable(r: Report, linked: Set<string>): string {
 </table>`;
 }
 
-function hotspotTable(r: Report): string {
+function hotspotTable(r: Report, links: Links): string {
   const rows = hotspots(r.fileCoverage);
   if (rows.length === 0) return '<p class="muted">No files with uncovered code.</p>';
   return `<table><thead><tr><th>File</th><th class="n">Coverage</th><th>Uncovered lines</th></tr></thead><tbody>${rows
     .map(row => {
       const pct = rowRate(row);
-      return `<tr><td class="name">${esc(row.path)}</td><td class="n ${tierOf(pct)}">${pctText(pct)}</td><td>${esc(row.missing || '—')}</td></tr>`;
+      const href = links.get(row.path);
+      const name = href ? `<a href="${esc(href)}">${esc(row.path)}</a>` : esc(row.path);
+      return `<tr><td class="name">${name}</td><td class="n ${tierOf(pct)}">${pctText(pct)}</td><td>${esc(row.missing || '—')}</td></tr>`;
     })
     .join('')}</tbody></table>`;
 }
 
-function sourcePage(file: FileCoverage, lines: string[]): string {
+// One page per source file: its covered and uncovered line counts, then the code with line marks.
+function renderSourcePage(file: FileCoverage, lines: string[], backHref: string): string {
   const covered = new Set(file.covered);
   const uncovered = new Set(file.uncovered);
   const rows = lines
@@ -109,13 +117,26 @@ function sourcePage(file: FileCoverage, lines: string[]): string {
     })
     .join('');
   const pct = file.executable === 0 ? 100 : (file.covered.length / file.executable) * 100;
-  return `<div class="src" id="${anchor(file.rel)}">
-<h3>${esc(file.rel)} <span class="muted">· ${file.covered.length}/${file.executable} lines covered (${pctText(pct)})</span></h3>
-<pre class="code">${rows}</pre>
-</div>`;
+  const tier = tierOf(file.executable === 0 ? undefined : pct);
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${esc(file.rel)} · Unit Test Report</title><style>${STYLE}</style></head>
+<body>
+<header><h1>${esc(file.rel)}</h1><p>Line coverage for this file</p><a class="btn" href="${esc(backHref)}">← Back to coverage</a></header>
+<main>
+<section class="panel file-summary">
+  <div><div class="big ${tier}">${pctText(pct)}</div><div class="bar"><span class="fill-${tier}" style="width:${pct}%"></span></div><div class="muted">Coverage</div></div>
+  <div><div class="big">${file.covered.length}</div><div class="muted">Covered lines</div></div>
+  <div><div class="big">${file.uncovered.length}</div><div class="muted">Uncovered lines</div></div>
+  <div><div class="big">${file.executable}</div><div class="muted">Coverable lines</div></div>
+</section>
+<section class="panel"><h2>Source</h2><pre class="code">${rows}</pre></section>
+</main>
+<footer>Generated by Test Automation Agent</footer>
+</body></html>`;
 }
 
-// Writes the HTML and PDF reports, replacing any earlier files at those paths.
+// Writes the HTML report, the per-file source pages next to it, and the PDF report. Earlier output is replaced.
 export async function writeReportFiles(r: Report, repoPath: string, htmlFile: string, pdfFile: string): Promise<void> {
   const sources = new Map<string, string[]>();
   for (const f of r.coverageFiles) {
@@ -125,12 +146,28 @@ export async function writeReportFiles(r: Report, repoPath: string, htmlFile: st
       // The file was removed or moved after the run; its source page is left out.
     }
   }
-  await fs.writeFile(htmlFile, renderHtml(r, sources), 'utf8');
+  const dirName = `${path.basename(htmlFile, path.extname(htmlFile))}-files`;
+  const dir = path.join(path.dirname(htmlFile), dirName);
+  await fs.rm(dir, { recursive: true, force: true });
+  await fs.mkdir(dir, { recursive: true });
+
+  const backHref = `../${path.basename(htmlFile)}#coverage`;
+  const links: Links = new Map();
+  let index = 0;
+  for (const f of r.coverageFiles) {
+    const lines = sources.get(f.rel);
+    if (!lines) continue;
+    const page = `file-${++index}.html`;
+    links.set(f.rel, `${dirName}/${page}`);
+    await fs.writeFile(path.join(dir, page), renderSourcePage(f, lines, backHref), 'utf8');
+  }
+
+  await fs.writeFile(htmlFile, renderHtml(r, links), 'utf8');
   await writeReportPdf(r, sources, pdfFile);
 }
 
-// Builds the single-file HTML report. `sources` maps each file in report.coverageFiles to its lines.
-export function renderHtml(r: Report, sources: Map<string, string[]>): string {
+// Builds the HTML report. `links` maps each file that has a source page to that page's href.
+export function renderHtml(r: Report, links: Links): string {
   const head = headline(r);
   const tier = tierOf(head.pct);
   // A branch or method card: the value when the language measures it, otherwise n/a.
@@ -143,17 +180,7 @@ export function renderHtml(r: Report, sources: Map<string, string[]>): string {
     <div class="bar"><span class="fill-${metricTier}" style="width:${pct}%"></span></div>
     <div class="muted">${after.covered} covered of ${after.total}</div>${beforePct === undefined ? '' : `<div class="muted">Before: ${pctText(beforePct)}</div>`}`;
   };
-  const linked = new Set(r.coverageFiles.map(f => f.rel));
-  const sourceParts = r.coverageFiles
-    .filter(f => sources.has(f.rel))
-    .map(f => sourcePage(f, sources.get(f.rel) ?? []))
-    .join('\n');
   const projects = r.projects.map(p => `<div>${esc(p)}</div>`).join('');
-  const testCases = r.testCases.length
-    ? r.testCases
-        .map(f => `<h3 class="muted" style="margin:10px 0 4px;color:#4338ca;font-family:Consolas,monospace">${esc(f.path)}</h3><ol>${f.names.map(n => `<li>${esc(n)}</li>`).join('') || '<li class="muted">No test case names detected.</li>'}</ol>`)
-        .join('')
-    : '<p class="muted">No test files were written in this run.</p>';
   const skipped = r.files.filter(f => f.status === 'skipped');
   const skippedHtml = skipped.length
     ? `<ul>${skipped.map(f => `<li><b>${esc(f.path)}</b>${f.note ? ` — <span class="muted">${esc(f.note)}</span>` : ''}</li>`).join('')}</ul>`
@@ -174,19 +201,19 @@ export function renderHtml(r: Report, sources: Map<string, string[]>): string {
   </dl></div>
   <div class="card"><h3>${esc(head.label)}</h3>
     <div class="big ${tier}">${pctText(head.pct)}</div>
-    <div class="bar"><span class="fill-${tier}" style="width:${head.pct}%"></span></div>
-    <div class="muted">${head.covered} covered of ${head.total}${r.coverageAfter.unit === 'functions' ? ' functions (name-based)' : ' lines'}</div>
-    <div class="muted">Before: ${pctText(r.coverageBefore.total === 0 ? 100 : (r.coverageBefore.covered / r.coverageBefore.total) * 100)}</div>
+    <div class="bar"><span class="fill-${tier}" style="width:${head.pct ?? 0}%"></span></div>
+    ${head.pct === undefined
+      ? '<div class="muted">No coverage tool is known for this language, so coverage is not available.</div>'
+      : `<div class="muted">${head.covered} covered of ${head.total}${r.coverageAfter.unit === 'functions' ? ' functions (name-based)' : ' lines'}</div>
+    <div class="muted">Before: ${pctText(r.coverageBefore.total === 0 ? 100 : (r.coverageBefore.covered / r.coverageBefore.total) * 100)}</div>`}
   </div>
   <div class="card"><h3>Branch coverage</h3>${metricCard(r.coverageAfter.branches, r.coverageBefore.branches)}</div>
   <div class="card"><h3>Method coverage</h3>${metricCard(r.coverageAfter.methods, r.coverageBefore.methods)}</div>
 </section>
 <section class="panel"><h2>Projects</h2>${projects}</section>
-<section class="panel"><h2>Risk hotspots</h2>${hotspotTable(r)}</section>
-<section class="panel"><h2>Coverage</h2>${coverageTable(r, linked)}</section>
-<section class="panel"><h2>Test cases written</h2>${testCases}</section>
+<section class="panel"><h2>Risk hotspots</h2>${hotspotTable(r, links)}</section>
+<section class="panel" id="coverage"><h2>Coverage</h2><p class="muted">Click a file name to see its covered and uncovered lines.</p>${coverageTable(r, links)}</section>
 <section class="panel"><h2>Skipped files</h2>${skippedHtml}</section>
-<section class="panel"><h2>Source files</h2>${sourceParts || '<p class="muted">No line-level data for these files.</p>'}</section>
 </main>
 <footer>Generated by Test Automation Agent</footer>
 </body></html>`;

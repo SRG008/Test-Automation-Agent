@@ -34,7 +34,6 @@ export function writeReportPdf(r: Report, sources: Map<string, string[]>, file: 
     drawCards(doc, r);
     drawHotspots(doc, r);
     drawCoverage(doc, r);
-    drawTestCases(doc, r);
     drawSkipped(doc, r);
     drawSources(doc, r, sources);
 
@@ -75,9 +74,11 @@ function drawCards(doc: Doc, r: Report): void {
   const tier = tierOf(head.pct);
   doc.font('Helvetica-Bold').fontSize(8).fillColor(COLORS.muted).text(head.label.toUpperCase(), x[1] + 10, top + 10, { lineBreak: false });
   doc.font('Helvetica-Bold').fontSize(28).fillColor(TEXT[tier]).text(pctText(head.pct), x[1] + 10, top + 24, { lineBreak: false });
-  drawBar(doc, x[1] + 10, top + 62, w - 20, head.pct, tier, 8);
+  drawBar(doc, x[1] + 10, top + 62, w - 20, head.pct ?? 0, tier, 8);
   doc.font('Helvetica').fontSize(8).fillColor(COLORS.muted).text(
-    `${head.covered} covered of ${head.total}${r.coverageAfter.unit === 'functions' ? ' functions (name-based)' : ' lines'}`,
+    head.pct === undefined
+      ? 'No coverage tool is known for this language.'
+      : `${head.covered} covered of ${head.total}${r.coverageAfter.unit === 'functions' ? ' functions (name-based)' : ' lines'}`,
     x[1] + 10,
     top + 78,
     { width: w - 20, lineBreak: false },
@@ -182,25 +183,6 @@ function coverageRow(doc: Doc, name: string, v: CoverageValues, bold: boolean, f
     { text: pctText(v.pct), width: 33, align: 'right', bold, color: TEXT[tier] },
   ], fill);
   drawBar(doc, MARGIN + 170 + 48 + 60 + 62 + 52 + 4, y + 4, 62, v.pct, tier, 8);
-}
-
-function drawTestCases(doc: Doc, r: Report): void {
-  section(doc, 'Test cases written');
-  if (r.testCases.length === 0) {
-    paragraph(doc, 'No test files were written in this run.', COLORS.muted);
-    return;
-  }
-  for (const file of r.testCases) {
-    ensureSpace(doc, ROW * 2);
-    doc.font('Helvetica-Bold').fontSize(9).fillColor(COLORS.band).text(file.path, { lineBreak: false });
-    doc.moveDown(0.2);
-    if (file.names.length === 0) {
-      paragraph(doc, 'No test case names were detected in this file.', COLORS.muted);
-    } else {
-      file.names.forEach((name, i) => paragraph(doc, `${i + 1}. ${name}`));
-    }
-    doc.moveDown(0.3);
-  }
 }
 
 function drawSkipped(doc: Doc, r: Report): void {

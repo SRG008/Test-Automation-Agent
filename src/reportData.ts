@@ -65,11 +65,12 @@ export function sumCounts(rows: FileCoverageRow[]): { covered: number; total: nu
   );
 }
 
-export function headline(report: Report): { label: string; pct: number; covered: number; total: number } {
+export function headline(report: Report): { label: string; pct: number | undefined; covered: number; total: number } {
   const s = report.coverageAfter;
+  // 'none' means no coverage tool exists for the language, so there is no percentage to show.
   return {
-    label: s.unit === 'lines' ? 'Line coverage' : 'Function coverage',
-    pct: summaryRate(s),
+    label: s.unit === 'none' ? 'Coverage' : s.unit === 'lines' ? 'Line coverage' : 'Function coverage',
+    pct: s.unit === 'none' ? undefined : summaryRate(s),
     covered: s.covered,
     total: s.total,
   };

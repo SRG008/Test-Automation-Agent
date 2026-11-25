@@ -2,17 +2,24 @@ import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
 import { CommandResult, runCommand } from '../shell';
-import { FileCoverage } from '../types';
+import { FileCoverage, Project } from '../types';
+import { isTestPath, learnLayout, placeTest } from './conventions';
+import { isSourceFile } from '../analysis';
 
 // Paths are repo-relative with forward slashes, as printed by `git ls-files`.
 export interface AdapterContext {
   repo: string;
+  // Test framework the adapter installs and writes for. Empty for languages without a known framework.
   framework: string;
+  // How the project's existing tests are written, from Copilot. Empty when there are none.
+  styleNote?: string;
   files: string[];
 }
 
 export interface LanguageAdapter {
   language: string;
+  // True for languages without a dedicated adapter. Their coverage is reported as not available.
+  generic?: boolean;
   testRules(framework: string): string;
   isSource(rel: string): boolean;
   isTest(rel: string): boolean;
@@ -22,7 +29,6 @@ export interface LanguageAdapter {
   testPathFor(rel: string, ctx: AdapterContext): string;
   // Returns an error message when the repo cannot be set up automatically.
   ensureTooling(ctx: AdapterContext): Promise<string | undefined>;
-  runTests(ctx: AdapterContext, testRel: string): Promise<CommandResult>;
   // Runs the whole project's tests under a coverage tool. Undefined when that tool is not available for the framework.
   coverage?(ctx: AdapterContext): Promise<FileCoverage[] | undefined>;
 }
@@ -78,8 +84,9 @@ function nearestProject(rel: string, projects: string[]): string | undefined {
 
 // ---------- Python (pytest / unittest) ----------
 
-const isPythonTest = (rel: string): boolean =>
-  rel.endsWith('.py') && (/^test_/.test(baseOf(rel)) || /_test\.py$/.test(baseOf(rel)) || /(^|\/)tests?\//.test(rel));
+const isPythonTest = (rel: string): boolean => rel.endsWith('.py') && isTestPath(rel);
+const isPythonSource = (rel: string): boolean =>
+  rel.endsWith('.py') && !isPythonTest(rel) && baseOf(rel) !== 'conftest.py' && !/(^|\/)(venv|\.venv|build|dist)\//.test(rel);
 
 // Prefers the project's own virtual environment so its dependencies are importable.
 export async function pythonFor(repo: string): Promise<string> {
@@ -93,20 +100,75 @@ export async function pythonFor(repo: string): Promise<string> {
   return 'python';
 }
 
+// Reads statement and missing-line counts for source files that no test loaded, using coverage.py's own analysis.
+const UNEXECUTED_MARK = 'AUTOTEST_UNEXECUTED:';
+const PY_ANALYZE = [
+  'import json, sys',
+  'import coverage',
+  'cov = coverage.Coverage(data_file=sys.argv[1])',
+  'cov.load()',
+  'out = []',
+  'for path in json.load(open(sys.argv[2], encoding="utf-8")):',
+  '    try:',
+  '        _, statements, _, missing, _ = cov.analysis2(path)',
+  '        out.append({"statements": sorted(statements), "missing": sorted(missing)})',
+  '    except Exception:',
+  '        out.append(None)',
+  `print("${UNEXECUTED_MARK}" + json.dumps(out))`,
+].join('\n');
+
+async function unexecutedPython(py: string, dir: string, repo: string, rels: string[]): Promise<FileCoverage[]> {
+  if (rels.length === 0) return [];
+  const script = path.join(dir, 'analyze.py');
+  const list = path.join(dir, 'files.json');
+  await fs.writeFile(script, PY_ANALYZE, 'utf8');
+  await fs.writeFile(list, JSON.stringify(rels.map(rel => path.join(repo, rel))), 'utf8');
+  const run = await runCommand(py, [script, path.join(dir, '.coverage'), list], repo, 300_000);
+  const line = run.output.split('\n').find(l => l.includes(UNEXECUTED_MARK));
+  if (run.code !== 0 || !line) return [];
+  const found = JSON.parse(line.slice(line.indexOf(UNEXECUTED_MARK) + UNEXECUTED_MARK.length)) as
+    | ({ statements: number[]; missing: number[] } | null)[];
+  return rels.flatMap((rel, i): FileCoverage[] => {
+    const f = found[i];
+    if (!f) return [];
+    const missing = new Set(f.missing);
+    return [{ rel, executable: f.statements.length, covered: f.statements.filter(n => !missing.has(n)), uncovered: f.missing }];
+  });
+}
+
+// Folders Python must put on its import path, found from the repo's own layout: a package's import root is
+// the first ancestor folder without an __init__.py (for example "src" for src/pkg/mod.py). Flat repos give "".
+async function pythonImportRoots(ctx: AdapterContext): Promise<string[]> {
+  const roots = new Set<string>();
+  for (const rel of ctx.files.filter(f => f.endsWith('.py'))) {
+    const parts = rel.split('/').slice(0, -1);
+    while (parts.length > 0 && (await fs.access(path.join(ctx.repo, ...parts, '__init__.py')).then(() => true, () => false))) {
+      parts.pop();
+    }
+    roots.add(parts.join('/'));
+  }
+  return [...roots].sort();
+}
+
+// PYTHONPATH with the detected import roots first, so both test runs and coverage can import the project's modules.
+export async function pythonEnv(ctx: AdapterContext): Promise<NodeJS.ProcessEnv> {
+  const roots = (await pythonImportRoots(ctx)).map(r => path.join(ctx.repo, ...r.split('/').filter(Boolean)));
+  const existing = process.env.PYTHONPATH ? [process.env.PYTHONPATH] : [];
+  return { PYTHONPATH: [...roots, ...existing].join(path.delimiter) };
+}
+
 const python: LanguageAdapter = {
   language: 'Python',
   testRules: framework =>
     framework === 'unittest'
       ? 'Import the module under test using its package path. Use unittest.TestCase classes.'
       : 'Import the module under test using its package path. Use plain pytest functions (def test_...) and pytest fixtures.',
-  isSource: rel =>
-    rel.endsWith('.py') && !isPythonTest(rel) && baseOf(rel) !== 'conftest.py' && !/(^|\/)(venv|\.venv|build|dist)\//.test(rel),
+  isSource: isPythonSource,
   isTest: isPythonTest,
   listFunctions: src => namesFrom(src, /^[ \t]*(?:async[ \t]+)?def[ \t]+([A-Za-z]\w*)[ \t]*\(/gm),
   testPathFor(rel, ctx) {
-    const existing = ctx.files.filter(isPythonTest);
-    const dir = existing.some(f => dirOf(f) === dirOf(rel)) ? dirOf(rel) : existing.length ? commonDir(existing) : 'tests';
-    return joinRel(dir, `test_${stemOf(rel)}.py`);
+    const layout = learnLayout(ctx.files.filter(isPythonSource), ctx.files.filter(isPythonTest));
+    return placeTest(rel, layout, { dir: () => 'tests', prefix: 'test_', suffix: '' });
   },
   async ensureTooling(ctx) {
     const py = await pythonFor(ctx.repo);
@@ -125,17 +187,10 @@ const python: LanguageAdapter = {
       `run "${py}" -m pip install ${missing.join(' ')} in the repository and read the error it prints. If pip is missing, run "${py}" -m ensurepip --upgrade. Check network or proxy access to PyPI, then click Start again.`,
     );
   },
-  async runTests(ctx, testRel) {
-    const py = await pythonFor(ctx.repo);
-    if (ctx.framework === 'unittest') {
-      return runCommand(py, ['-m', 'unittest', 'discover', '-s', dirOf(testRel) || '.', '-p', baseOf(testRel)], ctx.repo);
-    }
-    return runCommand(py, ['-m', 'pytest', testRel, '-q'], ctx.repo);
-  },
   async coverage(ctx) {
     const py = await pythonFor(ctx.repo);
     return withScratch(async dir => {
-      const env = { COVERAGE_FILE: path.join(dir, '.coverage') };
+      const env = { ...(await pythonEnv(ctx)), COVERAGE_FILE: path.join(dir, '.coverage') };
       const testArgs = ctx.framework === 'unittest' ? ['unittest', 'discover'] : ['pytest', '-q'];
       // Failing tests still leave coverage data behind, so the run's exit code is not checked here.
       await runCommand(py, ['-m', 'coverage', 'run', '--branch', '--source=.', '-m', ...testArgs], ctx.repo, 600_000, env);
@@ -152,7 +207,7 @@ const python: LanguageAdapter = {
           }
         >;
       };
-      return Object.entries(data.files).map(([file, f]) => ({
+      const measured = Object.entries(data.files).map(([file, f]) => ({
         // coverage.py reports absolute paths when --source is used, so they are made repo-relative.
         rel: toPosix(path.isAbsolute(file) ? path.relative(ctx.repo, file) : file),
         executable: f.summary.num_statements,
@@ -164,6 +219,9 @@ const python: LanguageAdapter = {
             ? undefined
             : { covered: f.summary.covered_branches ?? 0, total: f.summary.num_branches },
       }));
+      const seen = new Set(measured.map(m => m.rel));
+      const unseen = ctx.files.filter(f => python.isSource(f) && !seen.has(f));
+      return [...measured, ...(await unexecutedPython(py, dir, ctx.repo, unseen))];
     });
   },
 };
@@ -172,8 +230,13 @@ const python: LanguageAdapter = {
 // ---------- TypeScript / JavaScript (Vitest, Jest, Mocha) ----------
 
 const TS_FILE = /\.(ts|tsx|js|jsx|mjs|cjs)$/;
-const isTsTest = (rel: string): boolean =>
-  TS_FILE.test(rel) && (/\.(test|spec)\.[^/]+$/.test(baseOf(rel)) || /(^|\/)(__tests__|tests?)\//.test(rel));
+const isTsTest = (rel: string): boolean => TS_FILE.test(rel) && isTestPath(rel);
+const isTsSource = (rel: string): boolean =>
+  TS_FILE.test(rel) &&
+  !isTsTest(rel) &&
+  !/\.d\.ts$/.test(rel) &&
+  !/\.config\.[^/]+$/.test(baseOf(rel)) &&
+  !/(^|\/)(node_modules|dist|build|out|coverage)\//.test(rel);
 
 const TS_TOOLS: Record<string, string> = { Vitest: 'vitest', Jest: 'jest', Mocha: 'mocha' };
 
@@ -223,12 +286,7 @@ const typescript: LanguageAdapter = {
           : 'Use Vitest (import { describe, it, expect, vi } from "vitest").';
     return `${api} Import the code under test from its module path relative to the test file. Mock network, clock and file system access so tests are deterministic.`;
   },
-  isSource: rel =>
-    TS_FILE.test(rel) &&
-    !isTsTest(rel) &&
-    !/\.d\.ts$/.test(rel) &&
-    !/\.config\.[^/]+$/.test(baseOf(rel)) &&
-    !/(^|\/)(node_modules|dist|build|out|coverage)\//.test(rel),
+  isSource: isTsSource,
   isTest: isTsTest,
   listFunctions: src =>
     [
@@ -240,13 +298,8 @@ const typescript: LanguageAdapter = {
       ...namesFrom(src, /export[ \t]+(?:default[ \t]+)?(?:abstract[ \t]+)?class[ \t]+([A-Za-z_$][\w$]*)/g),
     ].filter((name, i, all) => all.indexOf(name) === i),
   testPathFor(rel, ctx) {
-    const name = `${stemOf(rel)}.test${extOf(rel)}`;
-    const existing = ctx.files.filter(isTsTest);
-    if (existing.some(f => dirOf(f) === dirOf(rel))) return joinRel(dirOf(rel), name);
-    const inTestsFolder = existing.filter(f => /(^|\/)__tests__\//.test(f));
-    if (inTestsFolder.length) return joinRel(commonDir(inTestsFolder), name);
-    if (existing.length) return joinRel(commonDir(existing), name);
-    return joinRel('tests', name);
+    const layout = learnLayout(ctx.files.filter(isTsSource), ctx.files.filter(isTsTest));
+    return placeTest(rel, layout, { dir: () => 'tests', prefix: '', suffix: '.test' });
   },
   async ensureTooling(ctx) {
     if (!ctx.files.includes('package.json')) return 'No package.json found at the repository root.';
@@ -288,14 +341,6 @@ const typescript: LanguageAdapter = {
       }
     }
     return undefined;
-  },
-  runTests(ctx, testRel) {
-    if (ctx.framework === 'Jest') return runCommand('npx', ['jest', testRel], ctx.repo);
-    if (ctx.framework === 'Mocha') {
-      const ts = isTsFile(testRel) ? ['--require', 'ts-node/register'] : [];
-      return runCommand('npx', ['mocha', ...ts, testRel], ctx.repo);
-    }
-    return runCommand('npx', ['vitest', 'run', testRel], ctx.repo);
   },
   async coverage(ctx) {
     if (ctx.framework !== 'Jest' && ctx.framework !== 'Vitest') return undefined;
@@ -372,7 +417,6 @@ const go: LanguageAdapter = {
       ? undefined
       : 'Go was not found. Install Go from https://go.dev/dl/, restart VS Code, then click Recheck.';
   },
-  runTests: (ctx, testRel) => runCommand('go', ['test', `./${dirOf(testRel)}`], ctx.repo),
   async coverage(ctx) {
     const modText = await fs.readFile(path.join(ctx.repo, 'go.mod'), 'utf8').catch(() => '');
     const modulePath = /^module\s+(\S+)/m.exec(modText)?.[1] ?? '';
@@ -507,7 +551,8 @@ interface JavaFileData { lines: Map<number, JavaLine>; methods: Map<string, bool
 
 const xmlAttr = (attrs: string, name: string): string | undefined => new RegExp(`\\b${name}="([^"]*)"`).exec(attrs)?.[1];
 
-// Reads one JaCoCo XML report into the per-file data. Source files are matched to src/main/java paths in the repo.
+// Reads one JaCoCo XML report into the per-file data. JaCoCo names files by package path, so each one is matched to
+// the repo file that ends with that path.
 function readJacoco(xml: string, ctx: AdapterContext, files: Map<string, JavaFileData>): void {
   const dataFor = (rel: string): JavaFileData => {
     let data = files.get(rel);
@@ -521,7 +566,7 @@ function readJacoco(xml: string, ctx: AdapterContext, files: Map<string, JavaFil
     const pkgName = xmlAttr(pkg[1], 'name') ?? '';
     const relOf = (file: string): string | undefined => {
       const key = pkgName ? `${pkgName}/${file}` : file;
-      return ctx.files.find(f => f === `src/main/java/${key}`);
+      return ctx.files.find(f => isJavaSource(f) && (f === key || f.endsWith(`/${key}`)));
     };
     for (const src of pkg[2].matchAll(/<sourcefile\b([^>]*)(?<!\/)>([\s\S]*?)<\/sourcefile>/g)) {
       const rel = relOf(xmlAttr(src[1], 'name') ?? '');
@@ -570,19 +615,26 @@ function javaFileCoverage(files: Map<string, JavaFileData>): FileCoverage[] {
     });
 }
 
+const isJavaTest = (rel: string): boolean => rel.endsWith('.java') && isTestPath(rel);
+const isJavaSource = (rel: string): boolean =>
+  rel.endsWith('.java') && !isJavaTest(rel) && !/(^|\/)(module|package)-info\.java$/.test(rel);
+
 const java: LanguageAdapter = {
   language: 'Java',
   testRules: framework =>
     framework === 'TestNG'
       ? 'Use TestNG (org.testng.annotations.Test and org.testng.Assert). Put the test class in the same package as the class under test, and name it after that class with a Test suffix.'
       : 'Use JUnit 5 (org.junit.jupiter.api.Test and Assertions). Put the test class in the same package as the class under test, and name it after that class with a Test suffix.',
-  isSource: rel => /^src\/main\/java\/.+\.java$/.test(rel) && !rel.endsWith('module-info.java'),
-  isTest: rel => /^src\/test\/java\/.+\.java$/.test(rel),
+  isSource: isJavaSource,
+  isTest: isJavaTest,
   listFunctions: src => namesFrom(src, /^[ \t]*public[ \t]+(?:(?:static|final|synchronized|abstract)[ \t]+)*[\w<>\[\],.? ]+?[ \t]+([a-z]\w*)[ \t]*\(/gm),
-  testPathFor(rel) {
-    const mapped = rel.replace(/^src\/main\/java\//, 'src/test/java/');
-    return joinRel(dirOf(mapped), `${stemOf(rel)}Test.java`);
+  testPathFor(rel, ctx) {
+    const layout = learnLayout(ctx.files.filter(isJavaSource), ctx.files.filter(isJavaTest));
+    // Without existing tests, mirror a Maven/Gradle "main" folder as "test"; otherwise keep the source folder.
+    const standard = { dir: (dir: string) => dir.replace(/(^|\/)main(?=\/)/, '$1test'), prefix: '', suffix: 'Test' };
+    return placeTest(rel, layout, standard);
   },
+
   async ensureTooling(ctx) {
     const build = ctx.files.find(f => ['pom.xml', 'build.gradle', 'build.gradle.kts'].includes(f));
     if (!build) return 'No pom.xml or build.gradle found. Add a Maven or Gradle build first.';
@@ -599,11 +651,6 @@ const java: LanguageAdapter = {
     if (build === 'pom.xml' && !updated.includes('jacoco-maven-plugin')) updated = addMavenJacoco(updated);
     if (updated !== text) await fs.writeFile(path.join(ctx.repo, build), updated, 'utf8');
     return undefined;
-  },
-  runTests(ctx, testRel) {
-    const className = stemOf(testRel);
-    if (ctx.files.includes('pom.xml')) return runCommand(buildTool(ctx, 'mvnw', 'mvn'), [`-Dtest=${className}`, 'test'], ctx.repo);
-    return runCommand(buildTool(ctx, 'gradlew', 'gradle'), ['test', '--tests', className], ctx.repo);
   },
   async coverage(ctx) {
     const files = new Map<string, JavaFileData>();
@@ -761,11 +808,6 @@ const csharp: LanguageAdapter = {
     ctx.files.push(planned);
     return ensureCoverlet(ctx);
   },
-  runTests(ctx, testRel) {
-    const projects = ctx.files.filter(isCsTestProject);
-    const proj = nearestProject(testRel, projects) ?? projects[0] ?? '.';
-    return runCommand('dotnet', ['test', proj], ctx.repo);
-  },
   async coverage(ctx) {
     const projects = ctx.files.filter(isCsTestProject);
     if (projects.length === 0) throw new Error('No .NET test project found.');
@@ -825,6 +867,30 @@ const csharp: LanguageAdapter = {
 };
 
 
+// Adapter for any language without a dedicated one. Source and test files come from the project's own lists (found by Copilot). Tests run through the repo's own test command, so no tooling is installed and coverage is not available.
+function genericAdapter(project: Project): LanguageAdapter {
+  // The project's lists are repo-relative, while adapters work with paths inside the project folder.
+  const repoPath = (rel: string): string => (project.root ? `${project.root}/${rel}` : rel);
+  const isTest = (rel: string): boolean => project.testFiles.includes(repoPath(rel));
+  const isSource = (rel: string): boolean => isSourceFile(project, repoPath(rel));
+  return {
+    language: project.language,
+    generic: true,
+    testRules: () =>
+      "Use the same test framework, naming, and assertion style as the existing test files in this project. Put every test in one self-contained test file that the project's test command runs.",
+    isSource,
+    isTest,
+    listFunctions: () => [],
+    testPathFor(rel, ctx) {
+      const layout = learnLayout(ctx.files.filter(isSource), ctx.files.filter(isTest));
+      return placeTest(rel, layout, { dir: sourceDir => joinRel('tests', sourceDir), prefix: '', suffix: '_test' });
+    },
+    async ensureTooling() {
+      return undefined;
+    },
+  };
+}
+
 const ADAPTERS: Record<string, LanguageAdapter> = {
   Python: python,
   'TypeScript/JavaScript': typescript,
@@ -833,8 +899,7 @@ const ADAPTERS: Record<string, LanguageAdapter> = {
   'C#': csharp,
 };
 
-export function adapterFor(language: string): LanguageAdapter {
-  const adapter = ADAPTERS[language];
-  if (!adapter) throw new Error(`No test support for ${language} yet.`);
-  return adapter;
+// The built-in adapter for the project's language when there is one, otherwise the generic adapter.
+export function adapterFor(project: Project): LanguageAdapter {
+  return ADAPTERS[project.language] ?? genericAdapter(project);
 }

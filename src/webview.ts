@@ -117,6 +117,8 @@ export function getHtml(cspSource: string): string {
     recheckTools: 'Checking tools…',
     setLanguage: 'Checking tools…',
     setFramework: 'Checking tools…',
+    setProject: 'Loading project…',
+    chooseFiles: 'Measuring test coverage…',
     start: 'Starting test generation…',
     startSelected: 'Starting test generation…',
     openHtml: 'Opening HTML report…',
@@ -188,17 +190,11 @@ export function getHtml(cspSource: string): string {
     var tools = state.tools || [];
     if (tools.length === 0) return '';
     var rows = tools.map(function (t) {
-      if (!t.required) {
-        // Framework rows are informational: a missing one is installed on Start.
-        var mark = t.ok ? '<span class="ok">✓</span>' : '<span class="muted">○</span>';
-        var text = t.ok ? '' : ' <span class="muted">' + esc(t.hint) + '</span>';
-        return '<div class="step">' + mark + ' ' + esc(t.name) + text + '</div>';
-      }
       var status = t.ok ? '<span class="ok">✓</span>' : '<span class="fail">✗</span>';
       var help = t.ok ? '' : ' <button class="btn secondary" data-url="' + esc(t.url) + '">' + esc(t.hint) + '</button>';
       return '<div class="step">' + status + ' ' + esc(t.name) + help + '</div>';
     }).join('');
-    return '<p class="muted">Required tools for ' + esc(state.language) + '</p>' + rows;
+    return '<p class="muted">Tools needed by the test commands</p>' + rows;
   }
   function installNote() {
     var missing = missingNames();
@@ -209,8 +205,8 @@ export function getHtml(cspSource: string): string {
   // Shows Recheck tools in place of the action while a required tool is missing.
   function renderConnect() {
     return '<h2>Auto Tests</h2>'
-      + '<p>Generate unit tests in the background using your GitHub Copilot.</p>'
-      + btn('Connect to Copilot', 'connect')
+      + '<p>Connect to GitHub Copilot to analyze this repository and generate unit tests in the background.</p>'
+      + btn('Connect to Copilot & Analyze', 'connect')
       + errorBlock();
   }
   function renderRepo() {
@@ -219,8 +215,43 @@ export function getHtml(cspSource: string): string {
       + btn('Retry', 'connect')
       + errorBlock();
   }
-  function frameworkText() {
-    return state.frameworkNeeded ? state.framework : (state.detectedFrameworks || []).join(', ');
+  // Only projects whose framework is unknown get a dropdown. Projects with existing tests show the framework found in them. The test command is derived from the framework in the background.
+  // One project is chosen at a time. Multi-project repos get a picker; the framework is asked only when the chosen project has no tests.
+  function languageProjectList() {
+    return (state.projects || []).filter(function (p) { return p.language === state.language; });
+  }
+  function chosenProject() {
+    return languageProjectList().filter(function (p) { return p.root === state.projectRoot; })[0] || null;
+  }
+  function testCommandFields() {
+    var projects = languageProjectList();
+    if (projects.length === 0) return '';
+    var chosen = chosenProject();
+    var html = '';
+    if (projects.length > 1) {
+      html += '<label>Project</label><select data-change="setProject">'
+        + '<option value="" disabled hidden' + (chosen ? '' : ' selected') + '>Choose a project…</option>'
+        + projects.map(function (p) {
+          var name = p.root || '(repository root)';
+          return '<option value="' + esc(p.root) + '"' + (chosen === p ? ' selected' : '') + '>'
+            + esc(name + (p.hasTests ? ' (has tests)' : ' (no tests)')) + '</option>';
+        }).join('')
+        + '</select>';
+    } else if (!chosen) {
+      chosen = projects[0];
+    }
+    if (!chosen) return html + '<p class="muted">Choose a project to continue.</p>';
+    if (chosen.framework && chosen.hasTests) {
+      return html + '<p class="muted">Test framework: ' + esc(chosen.framework) + ' (from existing tests)</p>';
+    }
+    if (!chosen.frameworkOptions || !chosen.frameworkOptions.length) return html;
+    var options = [''].concat(chosen.frameworkOptions);
+    html += '<label>Test framework</label><select data-change="setFramework" data-root="' + esc(chosen.root) + '">'
+      + options.map(function (o) {
+        var text = o || (chosen.hasTests ? 'Not detected: choose one' : 'Choose a framework…');
+        return '<option value="' + esc(o) + '"' + ((chosen.framework || '') === o ? ' selected' : '') + '>' + esc(text) + '</option>';
+      }).join('') + '</select>';
+    return html + '<p class="muted">The test command is set up automatically from the framework.</p>';
   }
   function renderBranch() {
     var langField = state.languages.length > 1
@@ -234,12 +265,8 @@ export function getHtml(cspSource: string): string {
         + btn('Recheck tools', 'recheckTools', 'secondary')
         + errorBlock();
     }
-    var fwField = state.frameworkNeeded
-      ? selectField('Test framework', 'setFramework', state.frameworks, state.framework)
-      : '<p class="muted">Existing tests use: ' + esc(frameworkText()) + '</p>';
     return '<h2>Auto Tests</h2>' + connectedLine() + repoLine() + '<hr>'
       + langField
-      + fwField
       + toolsBlock()
       + '<p class="muted">Pulls the latest of the base branch, then creates the new branch on top of it.</p>'
       + selectField('Base branch', 'setBaseBranch', state.branches, state.baseBranch)
@@ -250,15 +277,20 @@ export function getHtml(cspSource: string): string {
   function renderReady() {
     var head = '<h2>Auto Tests</h2>' + connectedLine() + repoLine() + '<hr>'
       + '<p class="ok">✓ Created branch <b>' + esc(state.newBranch) + '</b></p>'
-      + '<p class="muted">From latest ' + esc(state.baseBranch) + ' · ' + esc(frameworkText()) + '</p>'
+      + '<p class="muted">From latest ' + esc(state.baseBranch) + '</p>'
       + toolsBlock()
       + installNote();
     if (missingNames().length > 0) return head + btn('Recheck tools', 'recheckTools', 'secondary') + errorBlock();
     if (state.choosing) return head + renderChooser() + errorBlock();
+    var chosen = chosenProject();
+    var ready = !!(chosen && chosen.framework && chosen.testCommand);
     return head
-      + '<p class="muted">Write tests for every source file, or pick the files and folders yourself.</p>'
-      + btn('▶ Create test cases for all files', 'start')
-      + btn('Choose files and folders', 'chooseFiles', 'secondary')
+      + testCommandFields()
+      + (ready
+        ? '<p class="muted">Write tests for every source file, or pick the files and folders yourself.</p>'
+          + btn('▶ Create test cases for all files', 'start')
+          + btn('Choose files and folders', 'chooseFiles', 'secondary')
+        : '')
       + errorBlock();
   }
 
@@ -311,7 +343,12 @@ export function getHtml(cspSource: string): string {
     var count = (state.selected || []).length;
     if (total === 0) return '<p class="muted">No source files found for ' + esc(state.language) + '.</p>' + btn('Back', 'backToOptions', 'secondary');
     var percent = Math.round(count * 100 / total);
+    var chosen = chosenProject();
+    var note = chosen && chosen.hasTests
+      ? '<p class="muted">Files at 100% coverage are hidden. Only files with uncovered code or no tests are listed.</p>'
+      : '';
     return '<div class="chooser-head"><h2>Choose files</h2><span class="pill">' + count + ' / ' + total + '</span></div>'
+      + note
       + '<div class="sel-track"><div class="sel-fill" style="width:' + percent + '%"></div></div>'
       + '<div class="chooser">' + treeHtml(buildTree(state.sourceFiles), picked) + '</div>'
       + (count ? btn('▶ Generate tests for ' + count + ' selected', 'startSelected') : '<p class="muted">Tick a file or folder to enable generation.</p>')
@@ -363,8 +400,10 @@ export function getHtml(cspSource: string): string {
       + '<p class="ok">✓ Completed on <b>' + esc(r.branch) + '</b></p>'
       + '<div class="stat"><span>Files written</span><span>' + r.filesWritten + '</span></div>'
       + '<div class="stat"><span>Files skipped</span><span>' + r.filesSkipped + '</span></div>'
-      + '<div class="stat"><span>' + (r.coverageAfter.unit === 'lines' ? 'Line coverage' : 'Function coverage') + '</span><span>' + covText(r.coverageBefore) + ' → ' + covText(r.coverageAfter) + '</span></div>'
-      + '<div class="stat"><span>Files fully covered</span><span>' + r.coverageBefore.filesCovered + '/' + r.coverageBefore.filesTotal + ' → ' + r.coverageAfter.filesCovered + '/' + r.coverageAfter.filesTotal + '</span></div>'
+      + (r.coverageAfter.unit === 'none'
+        ? '<div class="stat"><span>Coverage</span><span>Not available</span></div>'
+        : '<div class="stat"><span>' + (r.coverageAfter.unit === 'lines' ? 'Line coverage' : 'Function coverage') + '</span><span>' + covText(r.coverageBefore) + ' → ' + covText(r.coverageAfter) + '</span></div>'
+          + '<div class="stat"><span>Files fully covered</span><span>' + r.coverageBefore.filesCovered + '/' + r.coverageBefore.filesTotal + ' → ' + r.coverageAfter.filesCovered + '/' + r.coverageAfter.filesTotal + '</span></div>')
       + btn('View HTML Report', 'openHtml', 'secondary')
       + btn('Save PDF…', 'savePdf', 'secondary')
       + btn('Run Again', 'start', 'secondary')
@@ -414,7 +453,7 @@ export function getHtml(cspSource: string): string {
   app.addEventListener('change', function (e) {
     var t = e.target;
     if (t.dataset && t.dataset.toggle) { send(t.dataset.toggle, { value: t.dataset.path, checked: t.checked }); return; }
-    if (t.dataset && t.dataset.change) { showBusy(t.dataset.change); send(t.dataset.change, { value: t.value }); }
+    if (t.dataset && t.dataset.change) { showBusy(t.dataset.change); send(t.dataset.change, { value: t.value, root: t.dataset.root }); }
   });
 </script>
 </body>
