@@ -3,7 +3,7 @@ import * as path from 'path';
 import { askCopilot, extractCode } from './copilot';
 import { trackedFiles } from './gitOps';
 import { adapterFor, AdapterContext, LanguageAdapter } from './languages/adapters';
-import { CoverageSummary, FileCount, FileCoverage, FileCoverageRow, FileResult, Progress, Project, Report, StepStatus } from './types';
+import { CoverageSummary, Counts, FileCount, FileCoverage, FileCoverageRow, FileResult, LiveStatus, Progress, Project, Report, StepStatus } from './types';
 
 export interface RunConfig {
   repoPath: string;
@@ -49,6 +49,7 @@ interface FileMeasure {
   covered: number;
   total?: number;
   missing: string;
+  lines?: FileCoverage; // set only when the file has line coverage data
 }
 
 interface Measured extends CoverageSummary {
@@ -67,6 +68,9 @@ interface Job {
 }
 
 const read = (abs: string): Promise<string> => fs.readFile(abs, 'utf8').catch(() => '');
+// Adds two counts; the sum is undefined as soon as either side is not measured.
+const addCounts = (a: Counts | undefined, b: Counts | undefined): Counts | undefined =>
+  a && b ? { covered: a.covered + b.covered, total: a.total + b.total } : undefined;
 const escapeName = (name: string): string => name.replace(/\$/g, '\\$');
 const tail = (text: string): string => text.slice(-OUTPUT_TAIL).trim();
 const joinRepo = (root: string, rel: string): string => (root ? `${root}/${rel}` : rel);
@@ -92,6 +96,8 @@ async function measure(job: Job): Promise<Measured> {
 async function measureLines(job: Job, coverage: FileCoverage[]): Promise<Measured> {
   const byRel = new Map(coverage.map(f => [f.rel, f]));
   const result: Measured = { unit: 'lines', covered: 0, total: 0, filesCovered: 0, filesTotal: 0, targets: [], files: [] };
+  let branches: Counts | undefined = { covered: 0, total: 0 };
+  let methods: Counts | undefined = { covered: 0, total: 0 };
   for (const rel of job.sources) {
     const file = byRel.get(rel);
     if (!file) {
@@ -105,11 +111,14 @@ async function measureLines(job: Job, coverage: FileCoverage[]): Promise<Measure
     result.filesTotal++;
     result.total += file.executable;
     result.covered += file.executable - file.uncovered.length;
+    branches = addCounts(branches, file.branches);
+    methods = addCounts(methods, file.methods);
     result.files.push({
       rel,
       covered: file.executable - file.uncovered.length,
       total: file.executable,
       missing: file.uncovered.join(', '),
+      lines: { ...file, rel },
     });
     if (file.uncovered.length === 0) {
       result.filesCovered++;
@@ -117,8 +126,11 @@ async function measureLines(job: Job, coverage: FileCoverage[]): Promise<Measure
       result.targets.push({ rel, lines: file.uncovered, functions: [] });
     }
   }
+  result.branches = branches;
+  result.methods = methods;
   return result;
 }
+
 
 // Fallback for languages without a coverage tool: a function counts as covered when a test file refers to its name.
 async function measureNames(job: Job): Promise<Measured> {
@@ -148,7 +160,15 @@ async function measureNames(job: Job): Promise<Measured> {
 
 // Adds up every project. The unit is 'lines' only when every project could measure lines.
 async function measureAll(jobs: Job[]): Promise<{ summary: CoverageSummary; targets: Array<{ job: Job; target: Target }>; files: FileMeasure[] }> {
-  const summary: CoverageSummary = { unit: 'lines', covered: 0, total: 0, filesCovered: 0, filesTotal: 0 };
+  const summary: CoverageSummary = {
+    unit: 'lines',
+    covered: 0,
+    total: 0,
+    filesCovered: 0,
+    filesTotal: 0,
+    branches: { covered: 0, total: 0 },
+    methods: { covered: 0, total: 0 },
+  };
   const targets: Array<{ job: Job; target: Target }> = [];
   const files: FileMeasure[] = [];
   for (const job of jobs) {
@@ -158,8 +178,16 @@ async function measureAll(jobs: Job[]): Promise<{ summary: CoverageSummary; targ
     summary.total += measured.total;
     summary.filesCovered += measured.filesCovered;
     summary.filesTotal += measured.filesTotal;
+    summary.branches = addCounts(summary.branches, measured.branches);
+    summary.methods = addCounts(summary.methods, measured.methods);
     targets.push(...measured.targets.map(target => ({ job, target })));
-    files.push(...measured.files.map(f => ({ ...f, rel: joinRepo(job.root, f.rel) })));
+    files.push(
+      ...measured.files.map(f => ({
+        ...f,
+        rel: joinRepo(job.root, f.rel),
+        lines: f.lines && { ...f.lines, rel: joinRepo(job.root, f.rel) },
+      })),
+    );
   }
   return { summary, targets, files };
 }
@@ -224,6 +252,7 @@ async function writeAndVerify(
   target: Target,
   testRel: string,
   isCancelled: () => boolean,
+  setPhase: (phase: string, tests?: string[]) => void,
 ): Promise<FileResult> {
   const abs = path.join(ctx.repo, testRel);
   const original = await fs.readFile(abs, 'utf8').catch(() => undefined);
@@ -233,14 +262,17 @@ async function writeAndVerify(
     await fs.mkdir(path.dirname(abs), { recursive: true });
     await fs.writeFile(abs, content, 'utf8');
     if (!ctx.files.includes(testRel)) ctx.files.push(testRel);
+    setPhase('Running tests', testCaseNames(content));
   };
 
+  setPhase('Asking Copilot for tests');
   let content = extractCode(await askCopilot(buildPrompt(adapter, ctx, target, testRel, source, original)));
   await save(content);
   let run = await adapter.runTests(ctx, testRel);
 
   for (let attempt = 0; run.code !== 0 && attempt < MAX_FIXES; attempt++) {
     if (isCancelled()) throw new Error('Run cancelled.');
+    setPhase(`Fixing failing tests (attempt ${attempt + 1} of ${MAX_FIXES})`);
     content = extractCode(await askCopilot(buildFixPrompt(adapter, ctx, target, testRel, source, content, run.output)));
     await save(content);
     run = await adapter.runTests(ctx, testRel);
@@ -275,18 +307,19 @@ export async function runGeneration(
   const roots = projects.map(p => p.root);
   const runStartedAt = Date.now();
   const steps: StepStatus[] = STEP_LABELS.map((label, i) => ({ label, status: 'pending', estimateSec: STEP_ESTIMATES[i] }));
-  const snapshot = (done: number, current?: string): Progress => ({
+  let live: LiveStatus | undefined;
+  const snapshot = (done: number): Progress => ({
     steps: steps.map(s => ({ ...s })),
     done,
     total: steps.length,
-    current,
+    live: live && { ...live, tests: [...live.tests] },
     startedAt: runStartedAt,
   });
-  const begin = (i: number, current?: string) => {
+  const begin = (i: number) => {
     if (isCancelled()) throw new Error('Run cancelled.');
     steps[i].status = 'active';
     steps[i].startedAt = Date.now();
-    onProgress(snapshot(i, current ?? steps[i].label));
+    onProgress(snapshot(i));
   };
   const finish = (i: number) => {
     steps[i].status = 'done';
@@ -322,19 +355,27 @@ export async function runGeneration(
   begin(2);
   const files: FileResult[] = [];
   const handled = new Set<string>();
-  for (const { job, target } of before.targets) {
+  const planned = before.targets.length;
+  for (const [i, { job, target }] of before.targets.entries()) {
     if (isCancelled()) throw new Error('Run cancelled.');
     const testRel = job.adapter.testPathFor(target.rel, job.ctx);
     const shown = joinRepo(job.root, testRel);
-    onProgress(snapshot(2, `Writing ${shown}`));
+    const sourceShown = joinRepo(job.root, target.rel);
     if (handled.has(shown)) {
       files.push({ path: shown, status: 'skipped', note: 'Another source file in this run already writes this test file.' });
       continue;
     }
     handled.add(shown);
-    const result = await writeAndVerify(job.adapter, job.ctx, target, testRel, isCancelled);
+    live = { index: i + 1, total: planned, file: sourceShown, phase: 'Starting', tests: [] };
+    const setPhase = (phase: string, tests?: string[]) => {
+      live = { index: i + 1, total: planned, file: sourceShown, phase, tests: tests ?? live?.tests ?? [] };
+      onProgress(snapshot(2));
+    };
+    setPhase('Starting');
+    const result = await writeAndVerify(job.adapter, job.ctx, target, testRel, isCancelled, setPhase);
     files.push({ ...result, path: shown });
   }
+  live = undefined;
   finish(2);
 
   begin(3);
@@ -370,6 +411,7 @@ export async function runGeneration(
     coverageBefore: before.summary,
     coverageAfter: after.summary,
     fileCoverage,
+    coverageFiles: after.files.flatMap(f => (f.lines ? [f.lines] : [])),
     files,
     testCases,
     remaining: after.targets.map(({ job, target }) => joinRepo(job.root, target.rel)),
