@@ -54,16 +54,18 @@ export function getHtml(cspSource: string): string {
   .file { display: flex; justify-content: space-between; width: 100%; background: none; border: none; color: var(--vscode-textLink-foreground); cursor: pointer; padding: 3px 0; font: inherit; font-size: 12px; text-align: left; }
   .file:hover { text-decoration: underline; }
   .chooser { border: 1px solid var(--vscode-editorWidget-border, #444); border-radius: 4px; padding: 6px 8px; margin: 8px 0; max-height: 320px; overflow-y: auto; }
-  .chooser label { display: flex; align-items: center; gap: 6px; font-size: 12px; margin: 3px 0; cursor: pointer; word-break: break-all; }
-  .chooser { background: var(--vscode-editor-background); }
-  .chooser .indent { margin-left: 16px; }
-  .chooser label { padding: 2px 4px; border-radius: 3px; transition: background .12s ease; }
-  .chooser label:hover { background: var(--vscode-list-hoverBackground); }
-  .chooser input[type=checkbox] { accent-color: #a855f7; margin: 0; cursor: pointer; flex-shrink: 0; }
-  .folder-row { display: flex; align-items: center; gap: 2px; }
-  .folder-row label { flex: 1; min-width: 0; }
-  .chev { display: inline-block; width: 16px; text-align: center; cursor: pointer; user-select: none; opacity: .75; transition: transform .2s ease; }
+  .chooser { overflow-x: hidden; background: var(--vscode-editor-background); }
+  .tree-row { display: flex; align-items: center; gap: 4px; min-height: 22px; padding: 0 4px; border-radius: 3px; transition: background .12s ease; }
+  .tree-row:hover { background: var(--vscode-list-hoverBackground); }
+  .tree-label { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0; margin: 0; font-size: 12px; opacity: 1; cursor: pointer; }
+  .tree-label input[type=checkbox] { accent-color: #a855f7; margin: 0; flex-shrink: 0; cursor: pointer; }
+  .tree-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tree-count { flex-shrink: 0; margin-left: auto; font-size: 11px; opacity: .6; }
+  .chev { flex-shrink: 0; width: 14px; text-align: center; cursor: pointer; user-select: none; opacity: .75; transition: transform .2s ease; }
   .chev:hover { opacity: 1; }
+  .chev-gap { flex-shrink: 0; width: 14px; }
+  .chooser .indent { margin-left: 7px; padding-left: 9px; border-left: 1px solid var(--vscode-editorWidget-border, #444); }
+  .folder-row { min-width: 0; }
   .folder.collapsed > .folder-row .chev { transform: rotate(-90deg); }
   .folder.collapsed > .indent { display: none; }
   .chooser-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
@@ -288,16 +290,17 @@ export function getHtml(cspSource: string): string {
       var all = filesUnder(f);
       var n = all.filter(function (p) { return picked[p]; }).length;
       html += '<div class="folder' + (collapsed[f.path] ? ' collapsed' : '') + '">'
-        + '<div class="folder-row"><span class="chev" data-collapse="' + esc(f.path) + '">▾</span>'
-        + '<label><input type="checkbox" data-toggle="toggleFolder" data-path="' + esc(f.path) + '"'
+        + '<div class="tree-row folder-row"><span class="chev" data-collapse="' + esc(f.path) + '">▾</span>'
+        + '<label class="tree-label"><input type="checkbox" data-toggle="toggleFolder" data-path="' + esc(f.path) + '"'
         + (n === all.length ? ' checked' : '')
         + (n > 0 && n < all.length ? ' data-indeterminate="1"' : '')
-        + '> <b>' + esc(k) + '/</b> <span class="muted">' + all.length + ' files</span></label></div>'
+        + '><span class="tree-name"><b>' + esc(k) + '/</b></span><span class="tree-count">' + all.length + ' files</span></label></div>'
         + '<div class="indent">' + treeHtml(f, picked) + '</div></div>';
     });
     node.files.slice().sort().forEach(function (p) {
-      html += '<label><input type="checkbox" data-toggle="toggleFile" data-path="' + esc(p) + '"'
-        + (picked[p] ? ' checked' : '') + '> ' + esc(p.split('/').pop()) + '</label>';
+      html += '<div class="tree-row"><span class="chev-gap"></span>'
+        + '<label class="tree-label"><input type="checkbox" data-toggle="toggleFile" data-path="' + esc(p) + '"'
+        + (picked[p] ? ' checked' : '') + '><span class="tree-name">' + esc(p.split('/').pop()) + '</span></label></div>';
     });
     return html;
   }
