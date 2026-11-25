@@ -58,7 +58,7 @@ export function getHtml(cspSource: string): string {
   .tree-row { display: flex; align-items: center; gap: 4px; min-height: 22px; padding: 0 4px; border-radius: 3px; transition: background .12s ease; }
   .tree-row:hover { background: var(--vscode-list-hoverBackground); }
   .tree-label { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0; margin: 0; font-size: 12px; opacity: 1; cursor: pointer; }
-  .tree-label input[type=checkbox] { accent-color: #a855f7; margin: 0; flex-shrink: 0; cursor: pointer; }
+  .tree-label input[type=checkbox] { flex: 0 0 auto; width: auto; height: 13px; margin: 0; padding: 0; border: none; background: none; accent-color: #a855f7; cursor: pointer; }
   .tree-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .tree-count { flex-shrink: 0; margin-left: auto; font-size: 11px; opacity: .6; }
   .chev { flex-shrink: 0; width: 14px; text-align: center; cursor: pointer; user-select: none; opacity: .75; transition: transform .2s ease; }
