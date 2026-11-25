@@ -93,13 +93,27 @@ async function measure(job: Job): Promise<Measured> {
 }
 
 // Real line coverage. Coverage tools leave out files that no test loads, so those are targeted by function name.
+// Coverage tools may report paths with other slashes, a "./" prefix, or relative to a different folder.
+function normalizeRel(p: string): string {
+  return p.replace(/\\/g, '/').replace(/^\.\//, '');
+}
+
+function findCoverage(coverage: FileCoverage[], rel: string): FileCoverage | undefined {
+  const want = normalizeRel(rel);
+  const exact = coverage.find(f => normalizeRel(f.rel) === want);
+  if (exact) return exact;
+  return coverage.find(f => {
+    const have = normalizeRel(f.rel);
+    return have.endsWith('/' + want) || want.endsWith('/' + have);
+  });
+}
+
 async function measureLines(job: Job, coverage: FileCoverage[]): Promise<Measured> {
-  const byRel = new Map(coverage.map(f => [f.rel, f]));
   const result: Measured = { unit: 'lines', covered: 0, total: 0, filesCovered: 0, filesTotal: 0, targets: [], files: [] };
   let branches: Counts | undefined = { covered: 0, total: 0 };
   let methods: Counts | undefined = { covered: 0, total: 0 };
   for (const rel of job.sources) {
-    const file = byRel.get(rel);
+    const file = findCoverage(coverage, rel);
     if (!file) {
       const functions = job.adapter.listFunctions(await read(path.join(job.ctx.repo, rel)));
       if (functions.length === 0) continue;

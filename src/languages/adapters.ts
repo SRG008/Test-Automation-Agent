@@ -153,7 +153,8 @@ const python: LanguageAdapter = {
         >;
       };
       return Object.entries(data.files).map(([file, f]) => ({
-        rel: toPosix(file),
+        // coverage.py reports absolute paths when --source is used, so they are made repo-relative.
+        rel: toPosix(path.isAbsolute(file) ? path.relative(ctx.repo, file) : file),
         executable: f.summary.num_statements,
         covered: f.executed_lines,
         uncovered: f.missing_lines,
