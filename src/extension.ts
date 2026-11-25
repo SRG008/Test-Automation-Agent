@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { AutoTestsViewProvider } from './sidebarProvider';
 
 export function activate(context: vscode.ExtensionContext): void {
-  const provider = new AutoTestsViewProvider();
+  const provider = new AutoTestsViewProvider(context.globalStorageUri.fsPath);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(AutoTestsViewProvider.viewType, provider, {
       // Keeps the progress view state while the sidebar is hidden during a background run.

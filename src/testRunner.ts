@@ -3,7 +3,7 @@ import * as path from 'path';
 import { askCopilot, extractCode } from './copilot';
 import { trackedFiles } from './gitOps';
 import { adapterFor, AdapterContext, LanguageAdapter } from './languages/adapters';
-import { CoverageSummary, FileCoverage, FileResult, Progress, Project, Report, StepStatus } from './types';
+import { CoverageSummary, FileCount, FileCoverage, FileCoverageRow, FileResult, Progress, Project, Report, StepStatus } from './types';
 
 export interface RunConfig {
   repoPath: string;
@@ -20,6 +20,18 @@ const STEP_LABELS = [
   'Writing and running tests',
   'Measuring coverage again',
 ];
+// Rough durations in seconds. The writing step is scaled by the number of files.
+const STEP_ESTIMATES = [20, 30, 0, 30];
+const SECONDS_PER_TEST_FILE = 60;
+
+// Test case declarations for the frameworks the agent writes. Group 1 is the test name.
+const TEST_NAME_PATTERNS: RegExp[] = [
+  /^\s*def (test\w*)\s*\(/gm, // Python
+  /\b(?:it|test)\(\s*['"`]([^'"`]+)['"`]/g, // Jest, Vitest, Mocha
+  /@(?:Parameterized)?Test\b[^{;]*?\bvoid\s+(\w+)\s*\(/g, // JUnit, TestNG
+  /\[(?:Fact|Theory|Test|TestMethod|TestCase)\b[^\]]*\][^{;]*?\b(?:void|Task)\s+(\w+)\s*\(/g, // xUnit, NUnit, MSTest
+  /^func (Test\w*)\s*\(/gm, // Go
+];
 
 // Fix attempts per test file before the file is reverted and reported as skipped.
 const MAX_FIXES = 3;
@@ -32,8 +44,16 @@ interface Target {
   functions: string[];
 }
 
+interface FileMeasure {
+  rel: string;
+  covered: number;
+  total?: number;
+  missing: string;
+}
+
 interface Measured extends CoverageSummary {
   targets: Target[];
+  files: FileMeasure[];
 }
 
 
@@ -71,7 +91,7 @@ async function measure(job: Job): Promise<Measured> {
 // Real line coverage. Coverage tools leave out files that no test loads, so those are targeted by function name.
 async function measureLines(job: Job, coverage: FileCoverage[]): Promise<Measured> {
   const byRel = new Map(coverage.map(f => [f.rel, f]));
-  const result: Measured = { unit: 'lines', covered: 0, total: 0, filesCovered: 0, filesTotal: 0, targets: [] };
+  const result: Measured = { unit: 'lines', covered: 0, total: 0, filesCovered: 0, filesTotal: 0, targets: [], files: [] };
   for (const rel of job.sources) {
     const file = byRel.get(rel);
     if (!file) {
@@ -79,11 +99,18 @@ async function measureLines(job: Job, coverage: FileCoverage[]): Promise<Measure
       if (functions.length === 0) continue;
       result.filesTotal++;
       result.targets.push({ rel, lines: [], functions });
+      result.files.push({ rel, covered: 0, missing: `no coverage data for: ${functions.join(', ')}` });
       continue;
     }
     result.filesTotal++;
     result.total += file.executable;
     result.covered += file.executable - file.uncovered.length;
+    result.files.push({
+      rel,
+      covered: file.executable - file.uncovered.length,
+      total: file.executable,
+      missing: file.uncovered.join(', '),
+    });
     if (file.uncovered.length === 0) {
       result.filesCovered++;
     } else {
@@ -97,7 +124,7 @@ async function measureLines(job: Job, coverage: FileCoverage[]): Promise<Measure
 async function measureNames(job: Job): Promise<Measured> {
   const { adapter, ctx } = job;
   const testText = (await Promise.all(ctx.files.filter(f => adapter.isTest(f)).map(f => read(path.join(ctx.repo, f))))).join('\n');
-  const result: Measured = { unit: 'functions', covered: 0, total: 0, filesCovered: 0, filesTotal: 0, targets: [] };
+  const result: Measured = { unit: 'functions', covered: 0, total: 0, filesCovered: 0, filesTotal: 0, targets: [], files: [] };
   for (const rel of job.sources) {
     const functions = adapter.listFunctions(await read(path.join(ctx.repo, rel)));
     if (functions.length === 0) continue;
@@ -108,6 +135,7 @@ async function measureNames(job: Job): Promise<Measured> {
     });
     result.total += functions.length;
     result.covered += functions.length - missing.length;
+    result.files.push({ rel, covered: functions.length - missing.length, total: functions.length, missing: missing.join(', ') });
     result.filesTotal++;
     if (missing.length === 0) {
       result.filesCovered++;
@@ -119,9 +147,10 @@ async function measureNames(job: Job): Promise<Measured> {
 }
 
 // Adds up every project. The unit is 'lines' only when every project could measure lines.
-async function measureAll(jobs: Job[]): Promise<{ summary: CoverageSummary; targets: Array<{ job: Job; target: Target }> }> {
+async function measureAll(jobs: Job[]): Promise<{ summary: CoverageSummary; targets: Array<{ job: Job; target: Target }>; files: FileMeasure[] }> {
   const summary: CoverageSummary = { unit: 'lines', covered: 0, total: 0, filesCovered: 0, filesTotal: 0 };
   const targets: Array<{ job: Job; target: Target }> = [];
+  const files: FileMeasure[] = [];
   for (const job of jobs) {
     const measured = await measure(job);
     if (measured.unit === 'functions') summary.unit = 'functions';
@@ -130,8 +159,9 @@ async function measureAll(jobs: Job[]): Promise<{ summary: CoverageSummary; targ
     summary.filesCovered += measured.filesCovered;
     summary.filesTotal += measured.filesTotal;
     targets.push(...measured.targets.map(target => ({ job, target })));
+    files.push(...measured.files.map(f => ({ ...f, rel: joinRepo(job.root, f.rel) })));
   }
-  return { summary, targets };
+  return { summary, targets, files };
 }
 
 
@@ -243,16 +273,19 @@ export async function runGeneration(
     ? config.projects
     : [{ language: config.language, root: '', hasTests: false, sources: 0 }];
   const roots = projects.map(p => p.root);
-  const steps: StepStatus[] = STEP_LABELS.map(label => ({ label, status: 'pending' }));
+  const runStartedAt = Date.now();
+  const steps: StepStatus[] = STEP_LABELS.map((label, i) => ({ label, status: 'pending', estimateSec: STEP_ESTIMATES[i] }));
   const snapshot = (done: number, current?: string): Progress => ({
     steps: steps.map(s => ({ ...s })),
     done,
     total: steps.length,
     current,
+    startedAt: runStartedAt,
   });
   const begin = (i: number, current?: string) => {
     if (isCancelled()) throw new Error('Run cancelled.');
     steps[i].status = 'active';
+    steps[i].startedAt = Date.now();
     onProgress(snapshot(i, current ?? steps[i].label));
   };
   const finish = (i: number) => {
@@ -285,6 +318,7 @@ export async function runGeneration(
   const before = await measureAll(jobs);
   finish(1);
 
+  steps[2].estimateSec = SECONDS_PER_TEST_FILE * before.targets.length;
   begin(2);
   const files: FileResult[] = [];
   const handled = new Set<string>();
@@ -307,53 +341,50 @@ export async function runGeneration(
   const after = await measureAll(jobs);
   finish(3);
 
+  const testCases = await Promise.all(
+    files
+      .filter(f => f.status === 'written')
+      .map(async f => ({ path: f.path, names: testCaseNames(await read(path.join(config.repoPath, f.path))) })),
+  );
+
+  const beforeByPath = new Map(before.files.map(f => [f.rel, f]));
+  const ratio = (c: FileCount): number => (c.total === undefined ? 0 : c.total === 0 ? 1 : c.covered / c.total);
+  const fileCoverage: FileCoverageRow[] = after.files
+    .map(f => {
+      const b = beforeByPath.get(f.rel);
+      return {
+        path: f.rel,
+        before: b && { covered: b.covered, total: b.total },
+        after: { covered: f.covered, total: f.total },
+        missing: f.missing,
+      };
+    })
+    .sort((a, b) => ratio(a.after) - ratio(b.after));
+
   return {
     branch: config.branch,
+    generatedAt: new Date().toLocaleString(),
     projects: jobs.map(j => `${j.root || 'Repository root'} · ${j.adapter.language} · ${j.framework}`),
     filesWritten: files.filter(f => f.status === 'written').length,
     filesSkipped: files.filter(f => f.status === 'skipped').length,
     coverageBefore: before.summary,
     coverageAfter: after.summary,
+    fileCoverage,
     files,
+    testCases,
+    remaining: after.targets.map(({ job, target }) => joinRepo(job.root, target.rel)),
   };
 }
 
-const pctOf = (s: CoverageSummary): number => (s.total === 0 ? 100 : Math.round((s.covered / s.total) * 100));
-const coverageCell = (s: CoverageSummary): string => `${pctOf(s)}% (${s.covered}/${s.total})`;
-
-export function renderReportMarkdown(r: Report): string {
-  const projectLines = r.projects.map(p => `- ${p}`);
-  const fileLines = r.files.length
-    ? r.files.flatMap(f => {
-        const header = `- \`${f.path}\`: ${f.status === 'written' ? 'written, tests pass' : 'skipped'}`;
-        if (!f.note) return [header];
-        return [header, '', '  ```', ...f.note.split('\n').map(l => `  ${l}`), '  ```'];
-      })
-    : ['_No test files written._'];
-  const lines = r.coverageAfter.unit === 'lines'
-    ? 'Line coverage counts executable lines that no test runs, as measured by each project\'s coverage tool.'
-    : 'Some projects have no coverage tool here, so they are measured by function name: a function counts as covered when a test file mentions its name.';
-  return [
-    '# Unit Test Generation Report',
-    '',
-    `**Branch:** \`${r.branch}\``,
-    '',
-    '| Metric | Before | After |',
-    '|---|---|---|',
-    `| ${r.coverageAfter.unit === 'lines' ? 'Line coverage' : 'Function coverage'} | ${coverageCell(r.coverageBefore)} | ${coverageCell(r.coverageAfter)} |`,
-    `| Files fully covered | ${r.coverageBefore.filesCovered}/${r.coverageBefore.filesTotal} | ${r.coverageAfter.filesCovered}/${r.coverageAfter.filesTotal} |`,
-    `| Files written | | ${r.filesWritten} |`,
-    `| Files skipped | | ${r.filesSkipped} |`,
-    '',
-    lines,
-    '',
-    '## Projects',
-    '',
-    ...projectLines,
-    '',
-    '## Files',
-    '',
-    ...fileLines,
-  ].join('\n');
+// Finds the test names in a test file in the order they appear.
+export function testCaseNames(text: string): string[] {
+  const found: Array<{ index: number; name: string }> = [];
+  for (const pattern of TEST_NAME_PATTERNS) {
+    for (const m of text.matchAll(pattern)) {
+      found.push({ index: m.index ?? 0, name: m[1].trim() });
+    }
+  }
+  return found.sort((a, b) => a.index - b.index).map(f => f.name);
 }
+
 

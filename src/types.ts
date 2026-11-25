@@ -3,6 +3,8 @@ export type Stage = 'connect' | 'repo' | 'branch' | 'ready' | 'running' | 'done'
 export interface StepStatus {
   label: string;
   status: 'pending' | 'active' | 'done';
+  estimateSec: number; // rough expected duration, shown to the user as "estimated time left"
+  startedAt?: number; // epoch ms when the step became active
 }
 
 export interface Progress {
@@ -10,6 +12,7 @@ export interface Progress {
   done: number;
   total: number;
   current?: string;
+  startedAt: number; // epoch ms when the run started
 }
 
 export interface FileResult {
@@ -43,14 +46,33 @@ export interface CoverageSummary {
   filesTotal: number;
 }
 
+// Covered and total for one source file. total is undefined when the file has no coverage data.
+export interface FileCount {
+  covered: number;
+  total?: number;
+}
+
+export interface FileCoverageRow {
+  path: string;
+  before?: FileCount;
+  after: FileCount;
+  missing: string; // uncovered line numbers, or function names when only name-based coverage exists
+}
+
 export interface Report {
   branch: string;
+  generatedAt: string;
   projects: string[];
   filesWritten: number;
   filesSkipped: number;
   coverageBefore: CoverageSummary;
   coverageAfter: CoverageSummary;
+  fileCoverage: FileCoverageRow[];
   files: FileResult[];
+  // Names of the test cases in each written test file.
+  testCases: Array<{ path: string; names: string[] }>;
+  // Source files that still have uncovered code after the run.
+  remaining: string[];
 }
 
 // One tool the chosen language needs on this machine, and whether it was found.
@@ -95,5 +117,6 @@ export type WebviewMessage =
   | { type: 'start' }
   | { type: 'cancel' }
   | { type: 'openReport' }
+  | { type: 'savePdf' }
   | { type: 'openFile'; value: string }
   | { type: 'openUrl'; value: string };
