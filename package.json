@@ -1,8 +1,9 @@
 {
   "name": "auto-unit-test-agent",
-  "displayName": "Auto Unit Test Agent",
+  "displayName": "Test Automation Agent",
   "description": "Generates unit tests in the background on a new branch using your GitHub Copilot.",
-  "version": "0.1.12",
+  "version": "0.1.14",
+  "icon": "media/icon.png",
   "publisher": "local",
   "private": true,
   "license": "UNLICENSED",

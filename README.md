@@ -1,4 +1,4 @@
-# Auto Unit Test Agent
+# Test Automation Agent
 
 A VS Code extension with its own sidebar icon. It connects to your signed-in GitHub Copilot, uses the git repository open in VS Code, creates a fresh branch from the latest version of a base branch you choose, and generates unit tests in the background on that branch.
 
