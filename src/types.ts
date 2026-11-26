@@ -110,6 +110,10 @@ export interface ToolCheck {
   url: string;
   // Required tools block the agent until installed. Test frameworks are optional: the agent installs them on Start.
   required: boolean;
+  // Set when the host can install the item: shown as the command the user allows, run in the background once allowed.
+  run?: { program: string; args: string[]; cwd: string };
+  // Installs without asking, e.g. npm packages for a frontend project that has none yet.
+  autoRun?: boolean;
 }
 
 export interface AppState {
@@ -133,6 +137,8 @@ export interface AppState {
   progress?: Progress;
   report?: Report;
   error?: string;
+  // What the host is doing right now, e.g. "Connecting to Copilot…"; shown over the screen until cleared.
+  status?: string;
 }
 
 export type WebviewMessage =
@@ -143,10 +149,13 @@ export type WebviewMessage =
   | { type: 'setBaseBranch'; value: string }
   | { type: 'setNewBranch'; value: string }
   | { type: 'recheckTools' }
+  | { type: 'runSetup'; value: string }
   | { type: 'createBranch' }
   | { type: 'start' }
   | { type: 'chooseFiles' }
   | { type: 'backToOptions' }
+  | { type: 'backToBranch' }
+  | { type: 'goBack' }
   | { type: 'toggleFile'; value: string; checked: boolean }
   | { type: 'toggleFolder'; value: string; checked: boolean }
   | { type: 'startSelected' }

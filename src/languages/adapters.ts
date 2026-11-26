@@ -238,7 +238,10 @@ const isTsSource = (rel: string): boolean =>
   !/\.config\.[^/]+$/.test(baseOf(rel)) &&
   !/(^|\/)(node_modules|dist|build|out|coverage)\//.test(rel);
 
-const TS_TOOLS: Record<string, string> = { Vitest: 'vitest', Jest: 'jest', Mocha: 'mocha' };
+export const TS_TOOLS: Record<string, string> = { Vitest: 'vitest', Jest: 'jest', Mocha: 'mocha' };
+
+// Runners the project already sets up itself (e.g. Angular CLI's Karma + Jasmine), so no package is added. Their tests run through the project's test command.
+const TS_OWN_RUNNERS = ['Jasmine'];
 
 // Packages a TypeScript project needs on top of the framework, so its test files compile and run.
 const TS_EXTRAS: Record<string, string[]> = {
@@ -267,6 +270,31 @@ function installFailure(what: string, output: string, fix: string): string {
   return `Could not install ${what}.\n${detail}\nHow to fix: ${fix}`;
 }
 
+// Without node_modules, every test run fails before any test starts, so install the project's own dependencies first.
+async function ensureNodeModules(ctx: AdapterContext): Promise<string | undefined> {
+  const installed = await fs.access(path.join(ctx.repo, 'node_modules')).then(
+    () => true,
+    () => false,
+  );
+  if (installed) return undefined;
+  const command = ctx.files.includes('package-lock.json') ? ['ci'] : ['install'];
+  const result = await runCommand('npm', command, ctx.repo, 600_000);
+  if (result.code === 0) return undefined;
+  return installFailure(
+    'the project dependencies',
+    result.output,
+    `run "npm ${command.join(' ')}" in the repository and fix the error it prints, then click Start again.`,
+  );
+}
+
+// Projects often generate their environment files from .env before running tests. Start from the placeholder
+// example when there is no .env, so the test script runs. Tests use mock data, so no real values are needed.
+async function ensureEnvFile(ctx: AdapterContext): Promise<void> {
+  if (!ctx.files.includes('.env.example') || ctx.files.includes('.env')) return;
+  await fs.copyFile(path.join(ctx.repo, '.env.example'), path.join(ctx.repo, '.env'));
+  ctx.files.push('.env');
+}
+
 // ts-jest is the transform for TypeScript tests, so write a config for it when the repo has none.
 async function ensureJestConfig(ctx: AdapterContext, pkg: { type?: string; jest?: unknown }): Promise<void> {
   if (pkg.jest !== undefined || ctx.files.some(f => /^jest\.config\.[cm]?[jt]s$/.test(f))) return;
@@ -283,8 +311,11 @@ const typescript: LanguageAdapter = {
         ? 'Use the Jest globals (describe, test, expect) and jest.mock for mocks.'
         : framework === 'Mocha'
           ? 'Use Mocha (describe and it) with the Node assert module.'
-          : 'Use Vitest (import { describe, it, expect, vi } from "vitest").';
-    return `${api} Import the code under test from its module path relative to the test file. Mock network, clock and file system access so tests are deterministic.`;
+          : framework === 'Jasmine'
+            ? 'Use the Jasmine globals (describe, it, expect) and jasmine.createSpyObj for mocks. For Angular, use TestBed with HttpClientTestingModule or stub providers, and never call real HTTP, the real environment files or real storage.'
+            : 'Use Vitest (import { describe, it, expect, vi } from "vitest").';
+    const mocks = framework === 'Jasmine' ? 'Use inline mock data in every test; it must not depend on a backend or .env values.' : '';
+    return `${api} ${mocks} Import the code under test from its module path relative to the test file. Mock network, clock and file system access so tests are deterministic. Every test must pass.`;
   },
   isSource: isTsSource,
   isTest: isTsTest,
@@ -311,7 +342,11 @@ const typescript: LanguageAdapter = {
     };
     const deps = { ...pkg.dependencies, ...pkg.devDependencies };
     const tool = TS_TOOLS[ctx.framework];
-    if (!tool) return `${ctx.framework} is not supported for TypeScript/JavaScript yet.`;
+    if (!tool && !TS_OWN_RUNNERS.includes(ctx.framework)) return `${ctx.framework} is not supported for TypeScript/JavaScript yet.`;
+    const bootstrapError = await ensureNodeModules(ctx);
+    if (bootstrapError) return bootstrapError;
+    await ensureEnvFile(ctx);
+    if (!tool) return undefined;
     const isTs = ctx.files.some(isTsFile);
     const missing = [tool, ...(isTs ? TS_EXTRAS[ctx.framework] ?? [] : [])].filter(p => !(p in deps));
     if (missing.length > 0) {
@@ -902,4 +937,26 @@ const ADAPTERS: Record<string, LanguageAdapter> = {
 // The built-in adapter for the project's language when there is one, otherwise the generic adapter.
 export function adapterFor(project: Project): LanguageAdapter {
   return ADAPTERS[project.language] ?? genericAdapter(project);
+}
+
+// The frameworks the built-in adapter can run for a language. Undefined for languages on the generic adapter.
+function builtInFrameworks(language: string): string[] | undefined {
+  switch (language) {
+    case 'Python': return ['pytest', 'unittest'];
+    case 'TypeScript/JavaScript': return [...Object.keys(TS_TOOLS), ...TS_OWN_RUNNERS];
+    case 'Java': return Object.keys(JAVA_FRAMEWORK);
+    case 'C#': return Object.keys(CS_TEMPLATE);
+    default: return undefined;
+  }
+}
+
+// Keeps only the frameworks the built-in adapter can run, spelled the way the adapter expects.
+// A framework found in the tests that the adapter cannot run is dropped, along with its test command.
+export function useSupportedFrameworks(project: Project): Project {
+  const supported = builtInFrameworks(project.language);
+  if (!supported) return project;
+  const match = (name: string): string | undefined => supported.find(f => f.toLowerCase() === name.trim().toLowerCase());
+  const framework = project.framework ? match(project.framework) : undefined;
+  const frameworkOptions = [...new Set(project.frameworkOptions.map(match).filter((f): f is string => f !== undefined))];
+  return { ...project, framework, frameworkOptions, testCommand: framework ? project.testCommand : undefined };
 }

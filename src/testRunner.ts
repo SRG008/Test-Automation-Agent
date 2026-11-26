@@ -433,6 +433,16 @@ export async function runGeneration(
   }
   finish(0);
 
+  // Existing tests must pass before new ones are written. Otherwise every new file would fail for the same environment reason.
+  for (const job of jobs) {
+    const baseline = await runSuite(job);
+    if (baseline.code !== 0) {
+      throw new Error(
+        `${job.root || 'Repository root'}: the existing tests fail before any new test is written. Fix this first:\n${baseline.output.trim().slice(-1500)}`,
+      );
+    }
+  }
+
   begin(1);
   const before = await measureAll(jobs);
   finish(1);

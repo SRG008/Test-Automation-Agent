@@ -18,6 +18,10 @@ export function getHtml(cspSource: string): string {
   .btn:active:not(:disabled) { transform: scale(.98); }
   .btn.secondary { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
   .btn:disabled { opacity: .5; cursor: default; }
+  .topbar { display: flex; align-items: center; margin: -4px 0 6px; }
+  .icon-btn { display: inline-flex; align-items: center; gap: 4px; padding: 3px 6px 3px 4px; border: none; border-radius: 3px; cursor: pointer; font: inherit; font-size: 12px; background: transparent; color: var(--vscode-foreground); }
+  .icon-btn:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, .2)); }
+  .icon-btn svg { width: 16px; height: 16px; fill: currentColor; }
   label { display: block; font-size: 12px; opacity: .85; margin-top: 10px; }
   select, input { width: 100%; box-sizing: border-box; margin: 4px 0 6px; padding: 4px; font: inherit; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, transparent); }
   .ok { color: var(--vscode-testing-iconPassed); }
@@ -129,8 +133,13 @@ export function getHtml(cspSource: string): string {
     busyText.textContent = BUSY[action];
     busy.hidden = false;
   }
-  // Any state message from the host means the action has finished.
+  // Any state message from the host means the action has finished, unless the host reports a step that is still running.
   function hideBusy() { busy.hidden = true; }
+  function showHostStatus() {
+    if (!state.status) return hideBusy();
+    busyText.textContent = state.status;
+    busy.hidden = false;
+  }
 
   function fmt(sec) {
     sec = Math.max(0, Math.round(sec));
@@ -191,17 +200,26 @@ export function getHtml(cspSource: string): string {
     if (tools.length === 0) return '';
     var rows = tools.map(function (t) {
       var status = t.ok ? '<span class="ok">✓</span>' : '<span class="fail">✗</span>';
-      var help = t.ok ? '' : ' <button class="btn secondary" data-url="' + esc(t.url) + '">' + esc(t.hint) + '</button>';
+      var help = '';
+      if (!t.ok && t.run) {
+        var program = t.run.program.replace(/^.*[\\\\/]/, '');
+        help = ' <button class="btn secondary" data-setup="' + esc(t.name) + '">Allow: ' + esc([program].concat(t.run.args).join(' ')) + '</button>';
+      } else if (!t.ok && t.url) {
+        help = ' <button class="btn secondary" data-url="' + esc(t.url) + '">' + esc(t.hint) + '</button>';
+      } else if (!t.ok) {
+        help = ' <span class="muted">' + esc(t.hint) + '</span>';
+      }
       return '<div class="step">' + status + ' ' + esc(t.name) + help + '</div>';
     }).join('');
-    return '<p class="muted">Tools needed by the test commands</p>' + rows;
+    return '<p class="muted">Prerequisites for the test commands</p>' + rows;
   }
   function installNote() {
     var missing = missingNames();
     return missing.length
-      ? '<p class="muted">Install the tools marked ✗ to continue. Each button opens its download page. Restart VS Code after installing, then click Recheck tools.</p>'
+      ? '<p class="muted">Allow the commands marked ✗ to continue. Each one runs in the background in the project folder. Tools with a link open their download page; restart VS Code after installing them, then click Recheck tools.</p>'
       : '';
   }
+
   // Shows Recheck tools in place of the action while a required tool is missing.
   function renderConnect() {
     return '<h2>Auto Tests</h2>'
@@ -244,7 +262,9 @@ export function getHtml(cspSource: string): string {
     if (chosen.framework && chosen.hasTests) {
       return html + '<p class="muted">Test framework: ' + esc(chosen.framework) + ' (from existing tests)</p>';
     }
-    if (!chosen.frameworkOptions || !chosen.frameworkOptions.length) return html;
+    if (!chosen.frameworkOptions || !chosen.frameworkOptions.length) {
+      return html + '<p class="muted">No supported test framework was found for this project.</p>';
+    }
     var options = [''].concat(chosen.frameworkOptions);
     html += '<label>Test framework</label><select data-change="setFramework" data-root="' + esc(chosen.root) + '">'
       + options.map(function (o) {
@@ -291,6 +311,7 @@ export function getHtml(cspSource: string): string {
           + btn('▶ Create test cases for all files', 'start')
           + btn('Choose files and folders', 'chooseFiles', 'secondary')
         : '')
+      + btn('Back', 'backToBranch', 'secondary')
       + errorBlock();
   }
 
@@ -413,6 +434,14 @@ export function getHtml(cspSource: string): string {
 
   var collapsed = {};
   var lastScreen = '';
+  // Screens that have a previous step. The running screen is left out because Cancel stops it.
+  var BACK_STAGES = { ready: true, done: true };
+  function topBar() {
+    if (!BACK_STAGES[state.stage]) return '';
+    return '<div class="topbar"><button class="icon-btn" data-action="goBack" title="Back to previous step" aria-label="Back to previous step">'
+      + '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M7.78 12.53a.75.75 0 0 1-1.06 0L2.47 8.28a.75.75 0 0 1 0-1.06l4.25-4.25a.75.75 0 0 1 1.06 1.06L4.81 7h7.44a.75.75 0 0 1 0 1.5H4.81l2.97 2.97a.75.75 0 0 1 0 1.06z"/></svg>'
+      + '<span>Back</span></button></div>';
+  }
   function render() {
     var views = { connect: renderConnect, repo: renderRepo, branch: renderBranch, ready: renderReady, running: renderRunning, done: renderDone };
     // Fade in only when the screen changes, so re-renders on each tick don't replay the animation.
@@ -423,7 +452,7 @@ export function getHtml(cspSource: string): string {
       clearTimeout(app.animTimer);
       app.animTimer = setTimeout(function () { app.classList.remove('anim'); }, 300);
     }
-    app.innerHTML = (views[state.stage] || renderConnect)();
+    app.innerHTML = topBar() + (views[state.stage] || renderConnect)();
     app.querySelectorAll('input[data-indeterminate]').forEach(function (el) { el.indeterminate = true; });
     updateTimers();
   }
@@ -431,7 +460,7 @@ export function getHtml(cspSource: string): string {
   window.addEventListener('message', function (e) {
     if (e.data && e.data.type === 'state') {
       state = e.data.state;
-      hideBusy();
+      showHostStatus();
       render();
     }
   });
@@ -445,7 +474,10 @@ export function getHtml(cspSource: string): string {
     }
     var action = e.target.closest('[data-action]');
     if (action && !action.disabled) { showBusy(action.dataset.action); send(action.dataset.action); return; }
+    var setup = e.target.closest('[data-setup]');
+    if (setup) { send('runSetup', { value: setup.dataset.setup }); return; }
     var link = e.target.closest('[data-url]');
+
     if (link) { send('openUrl', { value: link.dataset.url }); return; }
     var file = e.target.closest('[data-open]');
     if (file) send('openFile', { value: file.dataset.open });

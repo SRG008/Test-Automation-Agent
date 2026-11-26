@@ -4,7 +4,8 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { createBranchFromLatest, currentBranch, isGitRepo, listBranches, repoRoot, trackedFiles } from './gitOps';
 import { commandForFramework, detectProjects, ownerOf, rankLanguages } from './analysis';
-import { checkTools } from './preflight';
+import { checkTools, runSetup } from './preflight';
+import { useSupportedFrameworks } from './languages/adapters';
 import { filesNeedingTests, listSourceFiles, runGeneration } from './testRunner';
 import { writeReportFiles } from './reportHtml';
 import { getHtml } from './webview';
@@ -83,6 +84,9 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
         case 'recheckTools':
           await this.refreshTools();
           break;
+        case 'runSetup':
+          await this.installTool(msg.value);
+          break;
         case 'createBranch':
           await this.createBranch();
           break;
@@ -94,6 +98,22 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
           break;
         case 'backToOptions':
           this.state.choosing = false;
+          break;
+        case 'backToBranch':
+          this.state.branchReady = false;
+          this.state.choosing = false;
+          this.state.selected = [];
+          break;
+        // Steps back one screen: completed → ready, file chooser → ready, ready → branch.
+        case 'goBack':
+          if (this.state.report) {
+            this.state.report = undefined;
+          } else if (this.state.choosing) {
+            this.state.choosing = false;
+          } else {
+            this.state.branchReady = false;
+            this.state.selected = [];
+          }
           break;
         case 'toggleFile':
           this.setSelected([msg.value], msg.checked);
@@ -141,12 +161,20 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async connect(): Promise<void> {
-    const models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
-    if (models.length === 0) {
-      throw new Error('No Copilot model found. Sign in to GitHub Copilot in VS Code, then press Connect again.');
+    this.state.status = 'Connecting to Copilot…';
+    this.post();
+    try {
+      const models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
+      if (models.length === 0) {
+        throw new Error('No Copilot model found. Sign in to GitHub Copilot in VS Code, then press Connect again.');
+      }
+      this.state.model = models[0].name;
+      this.state.status = 'Analyzing the code…';
+      this.post();
+      await this.loadRepo();
+    } finally {
+      this.state.status = undefined;
     }
-    this.state.model = models[0].name;
-    await this.loadRepo();
   }
 
   // Re-reads the repository opened in VS Code when the workspace folders change.
@@ -175,7 +203,7 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
     const repo = await repoRoot(folder);
 
     const files = await trackedFiles(repo);
-    const projects = await detectProjects(repo, files);
+    const projects = (await detectProjects(repo, files)).map(useSupportedFrameworks);
     if (projects.length === 0) {
       throw new Error('No project found. The repository needs a build or package file, or source code in a recognized language.');
     }
@@ -198,11 +226,45 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
     this.state.newBranch = defaultNewBranchName();
   }
 
-  // Checks the tools the current language needs. Branch creation and generation stay blocked while any are missing.
+  // Checks the tools and setup items the current language needs. Items marked autoRun (npm packages) install in the background first.
+  // Branch creation and generation stay blocked while any required item is missing.
   private async refreshTools(): Promise<void> {
     const { repoPath, language, projects } = this.state;
     if (!repoPath || !language) return;
-    this.state.tools = await checkTools(repoPath, projects.filter(p => p.language === language));
+    const scoped = projects.filter(p => p.language === language);
+    let tools = await checkTools(repoPath, scoped);
+    const auto = tools.filter(t => t.autoRun && !t.ok && t.run);
+    if (auto.length > 0) {
+      try {
+        for (const item of auto) {
+          if (!item.run) continue;
+          this.state.status = `Installing ${item.name}…`;
+          this.post();
+          await runSetup(item.run);
+        }
+      } catch (err) {
+        this.state.error = err instanceof Error ? err.message : String(err);
+      } finally {
+        this.state.status = undefined;
+      }
+      tools = await checkTools(repoPath, scoped);
+    }
+    this.state.tools = tools;
+  }
+
+  // Runs the install command of one item the user allowed, then checks again.
+  private async installTool(name: string): Promise<void> {
+    const item = this.state.tools.find(t => t.name === name && t.run);
+    if (!item?.run) throw new Error('Nothing to install for this item.');
+    if (this.state.running) throw new Error('Wait for the current run to finish first.');
+    this.state.status = `Installing ${item.name}…`;
+    this.post();
+    try {
+      await runSetup(item.run);
+    } finally {
+      this.state.status = undefined;
+      await this.refreshTools();
+    }
   }
 
   private missingTools(): ToolCheck[] {
