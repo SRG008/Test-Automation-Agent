@@ -1,4 +1,4 @@
-export type Stage = 'connect' | 'repo' | 'branch' | 'ready' | 'running' | 'done';
+export type Stage = 'connect' | 'repo' | 'unsupported' | 'branch' | 'ready' | 'running' | 'done';
 
 export interface StepStatus {
   label: string;
@@ -21,6 +21,7 @@ export interface Progress {
   done: number;
   total: number;
   live?: LiveStatus;
+  note?: string; // shown while a setup problem is being fixed in the background
   startedAt: number; // epoch ms when the run started
 }
 
@@ -121,6 +122,8 @@ export interface AppState {
   repoPath?: string;
   projects: Project[];
   languages: string[];
+  // Frontend projects found in the repo. They are not supported yet, so they are listed here only.
+  unsupported: string[];
   language?: string;
   // The project the user picked in the sidebar, for the chosen language. Undefined until picked when there are several.
   projectRoot?: string;
@@ -139,10 +142,13 @@ export interface AppState {
   error?: string;
   // What the host is doing right now, e.g. "Connecting to Copilot…"; shown over the screen until cleared.
   status?: string;
+  // Set by the Back button on the frontend or branch screen to return to the Connect & Analyze screen.
+  showConnect?: boolean;
 }
 
 export type WebviewMessage =
   | { type: 'connect' }
+  | { type: 'backToConnect' }
   | { type: 'setLanguage'; value: string }
   | { type: 'setProject'; value: string }
   | { type: 'setFramework'; root: string; value: string }

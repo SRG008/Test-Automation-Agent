@@ -1,7 +1,7 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { askCopilot, extractCode } from './copilot';
-import { ownerOf } from './analysis';
+import { ownerOf, parseJson } from './analysis';
 import { trackedFiles } from './gitOps';
 import { isTestPath } from './languages/conventions';
 import { adapterFor, AdapterContext, LanguageAdapter, pythonEnv, pythonFor } from './languages/adapters';
@@ -354,6 +354,43 @@ async function writeAndVerify(
   };
 }
 
+const MAX_REPAIRS = 2;
+
+interface Repair {
+  action?: string;
+  command?: string;
+  reason?: string;
+}
+
+// Reads a failed baseline run and applies one safe fix: install packages, or switch to a runner that matches the framework. Anything else is returned as a reason for the user.
+async function repairBaseline(job: Job, output: string): Promise<{ fixed: boolean; reason: string }> {
+  const reply = parseJson<Repair>(
+    await askCopilot(
+      [
+        `Running the existing unit tests in ${job.ctx.repo} failed before any new test was written.`,
+        `Framework: ${job.framework}. Test command: ${job.testCommand}.`,
+        'Pick the single safest fix. Reply with JSON only, in one fenced block, as {"action": "install" | "set_command" | "none", "command": "...", "reason": "..."}.',
+        '"install": only "npm install" or "npm ci", when packages are missing.',
+        `"set_command": only a command starting with "npx" or exactly "npm test", that runs the suite with ${job.framework}.`,
+        '"none": when a person must act (secrets, a database, a source bug). Explain why in "reason".',
+        '--- test output (tail)',
+        output.slice(-3000),
+      ].join('\n'),
+    ),
+  );
+  const reason = reply?.reason?.trim() || 'No safe automatic fix was found.';
+  const command = reply?.command?.trim() ?? '';
+  if (reply?.action === 'install' && /^npm (install|ci)$/.test(command)) {
+    const run = await runCommandLine(command, job.ctx.repo);
+    return run.code === 0 ? { fixed: true, reason: 'Installed the missing packages.' } : { fixed: false, reason: `${reason} The install failed.` };
+  }
+  if (reply?.action === 'set_command' && (/^npx\s/.test(command) || command === 'npm test')) {
+    job.testCommand = command;
+    return { fixed: true, reason: `Switched the test command to "${command}".` };
+  }
+  return { fixed: false, reason };
+}
+
 // Runs the project's own test command over the whole suite, so a new test file must pass alongside the existing tests.
 async function runSuite(job: Job): Promise<CommandResult> {
   let commandLine = job.testCommand;
@@ -406,11 +443,13 @@ export async function runGeneration(
   const runStartedAt = Date.now();
   const steps: StepStatus[] = STEP_LABELS.map((label, i) => ({ label, status: 'pending', estimateSec: STEP_ESTIMATES[i] }));
   let live: LiveStatus | undefined;
+  let note: string | undefined;
   const snapshot = (done: number): Progress => ({
     steps: steps.map(s => ({ ...s })),
     done,
     total: steps.length,
     live: live && { ...live, tests: [...live.tests] },
+    note,
     startedAt: runStartedAt,
   });
   const begin = (i: number) => {
@@ -435,13 +474,25 @@ export async function runGeneration(
 
   // Existing tests must pass before new ones are written. Otherwise every new file would fail for the same environment reason.
   for (const job of jobs) {
-    const baseline = await runSuite(job);
+    let baseline = await runSuite(job);
+    let reason = '';
+    for (let attempt = 1; baseline.code !== 0 && attempt <= MAX_REPAIRS; attempt++) {
+      if (isCancelled()) throw new Error('Run cancelled.');
+      note = 'Existing tests failed. Looking for a fix in the background…';
+      onProgress(snapshot(0));
+      const repair = await repairBaseline(job, baseline.output);
+      reason = repair.reason;
+      if (!repair.fixed) break;
+      baseline = await runSuite(job);
+    }
+    note = undefined;
     if (baseline.code !== 0) {
       throw new Error(
-        `${job.root || 'Repository root'}: the existing tests fail before any new test is written. Fix this first:\n${baseline.output.trim().slice(-1500)}`,
+        `${job.root || 'Repository root'}: the existing tests fail before any new test is written. ${reason} Fix this first:\n${baseline.output.trim().slice(-1500)}`,
       );
     }
   }
+  onProgress(snapshot(0));
 
   begin(1);
   const before = await measureAll(jobs);

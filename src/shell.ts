@@ -1,4 +1,4 @@
-import { spawn } from 'child_process';
+import { ChildProcess, spawn, spawnSync } from 'child_process';
 
 export interface CommandResult {
   code: number;
@@ -6,19 +6,40 @@ export interface CommandResult {
 }
 
 const MAX_OUTPUT = 12000;
+const running = new Set<ChildProcess>();
+
+// Kills every command still running, including the processes it started (for example the test runner under npm).
+export function stopRunningCommands(): void {
+  for (const child of running) stopProcessTree(child);
+  running.clear();
+}
+
+// Starts a child in its own process group on Unix so the whole tree can be stopped.
+function track(child: ChildProcess): ChildProcess {
+  running.add(child);
+  child.on('close', () => running.delete(child));
+  child.on('error', () => running.delete(child));
+  return child;
+}
 
 // Runs a full command line, such as a repo's "npm test", through the system shell.
 export function runCommandLine(commandLine: string, cwd: string, timeoutMs = 600_000, env?: NodeJS.ProcessEnv): Promise<CommandResult> {
   return new Promise(resolve => {
-    const child = spawn(commandLine, { cwd, shell: true, windowsHide: true, env: env ? { ...process.env, ...env } : undefined });
+    const child = track(spawn(commandLine, {
+      cwd,
+      shell: true,
+      windowsHide: true,
+      detached: process.platform !== 'win32',
+      env: env ? { ...process.env, ...env } : undefined,
+    }));
     let output = '';
     const collect = (chunk: Buffer) => {
       output += chunk.toString();
       if (output.length > MAX_OUTPUT * 4) output = output.slice(-MAX_OUTPUT * 2);
     };
-    child.stdout.on('data', collect);
-    child.stderr.on('data', collect);
-    const timer = setTimeout(() => child.kill(), timeoutMs);
+    child.stdout?.on('data', collect);
+    child.stderr?.on('data', collect);
+    const timer = setTimeout(() => stopProcessTree(child), timeoutMs);
     child.on('error', err => {
       clearTimeout(timer);
       resolve({ code: -1, output: String(err) });
@@ -29,6 +50,20 @@ export function runCommandLine(commandLine: string, cwd: string, timeoutMs = 600
     });
   });
 }
+
+function stopProcessTree(child: ChildProcess): void {
+  if (child.pid === undefined) return;
+  if (process.platform === 'win32') {
+    spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true });
+    return;
+  }
+  try {
+    process.kill(-child.pid, 'SIGKILL');
+  } catch {
+    child.kill('SIGKILL');
+  }
+}
+
 
 // Runs a command in cwd and resolves with its exit code and the tail of its combined output.
 export function runCommand(
@@ -42,15 +77,21 @@ export function runCommand(
     const onWindows = process.platform === 'win32';
     // With shell: true on Windows, a path containing spaces must be quoted.
     const exe = onWindows && command.includes(' ') ? `"${command}"` : command;
-    const child = spawn(exe, args, { cwd, shell: onWindows, windowsHide: true, env: env ? { ...process.env, ...env } : undefined });
+    const child = track(spawn(exe, args, {
+      cwd,
+      shell: onWindows,
+      windowsHide: true,
+      detached: !onWindows,
+      env: env ? { ...process.env, ...env } : undefined,
+    }));
     let output = '';
     const collect = (chunk: Buffer) => {
       output += chunk.toString();
       if (output.length > MAX_OUTPUT * 4) output = output.slice(-MAX_OUTPUT * 2);
     };
-    child.stdout.on('data', collect);
-    child.stderr.on('data', collect);
-    const timer = setTimeout(() => child.kill(), timeoutMs);
+    child.stdout?.on('data', collect);
+    child.stderr?.on('data', collect);
+    const timer = setTimeout(() => stopProcessTree(child), timeoutMs);
     child.on('error', err => {
       clearTimeout(timer);
       resolve({ code: -1, output: String(err) });

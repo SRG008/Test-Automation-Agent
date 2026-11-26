@@ -44,15 +44,36 @@ export async function detectProjects(repo: string, files: string[]): Promise<Pro
       sources: own.filter(rel => isSourceFile(draft, rel)).length,
     };
     if (project.hasTests) await readTestSetup(repo, project);
-    if (project.framework && !project.testCommand) project.testCommand = await commandForFramework(repo, project);
+    const nodeCommand = await nodeTestCommand(repo, project);
+    if (nodeCommand) project.testCommand = nodeCommand;
+    else if (project.framework && !project.testCommand) project.testCommand = await commandForFramework(repo, project);
     projects.push(project);
   }
   return projects;
 }
 
+// The test command for a Node.js project. Uses the project's own "test" script when it has a real one; otherwise the chosen framework's runner.
+// Copilot's guess is not used here, because it can name a script the project does not have (npm reports "Missing script: test").
+// Jest's default pattern also matches bare test.js/spec.js files, which are often not tests; they are skipped here.
+const NODE_RUNNERS: Record<string, string> = { Jest: 'npx jest --passWithNoTests --testPathIgnorePatterns "(^|[\\\\/])(test|spec)\\.[jt]sx?$"', Vitest: 'npx vitest run', Mocha: 'npx mocha', Jasmine: 'npx jasmine' };
+export async function nodeTestCommand(repo: string, project: Project): Promise<string | undefined> {
+  if (project.language !== 'TypeScript/JavaScript' || !project.framework) return undefined;
+  const text = await fs.readFile(path.join(repo, project.root, 'package.json'), 'utf8').catch(() => '{}');
+  let script: unknown;
+  try {
+    script = (JSON.parse(text) as { scripts?: Record<string, unknown> }).scripts?.test;
+  } catch {
+    script = undefined;
+  }
+  if (typeof script === 'string' && script.trim() && !/no test specified/.test(script)) return 'npm test';
+  return NODE_RUNNERS[project.framework];
+}
+
 // The test command for a project after the user picks a framework. Copilot reads the project's build files.
 export async function commandForFramework(repo: string, project: Project): Promise<string | undefined> {
   if (!project.framework) return undefined;
+  const own = await nodeTestCommand(repo, project);
+  if (own) return own;
   const build = await readFiles(repo, project.buildFiles, FILE_CHARS, MAX_BUILD_FILES);
   const prompt = [
     `This ${project.language} project uses ${project.framework} for its unit tests.`,
@@ -62,6 +83,24 @@ export async function commandForFramework(repo: string, project: Project): Promi
   ].join('\n\n');
   const reply = parseJson<TestSetupReply>(await askCopilot(prompt));
   return reply?.testCommand?.trim() || undefined;
+}
+
+// Packages that make a Node.js project a frontend. Frontend projects are not supported yet.
+const UI_PACKAGES = [
+  '@angular/core', 'react', 'react-dom', 'vue', 'svelte', '@sveltejs/kit', 'next', 'nuxt', 'vite', 'solid-js',
+  'preact', 'lit', 'ember-source', 'gatsby', 'astro', '@remix-run/react', '@builder.io/qwik',
+];
+
+// A project is a frontend when its package.json uses a UI framework. The language label is not used,
+// because Copilot may name an Angular project differently.
+export async function isFrontendProject(repo: string, project: Project): Promise<boolean> {
+  const pkg = await fs
+    .readFile(path.join(repo, project.root, 'package.json'), 'utf8')
+    .then(t => JSON.parse(t) as { dependencies?: Record<string, string>; devDependencies?: Record<string, string> })
+    .catch(() => undefined);
+  if (!pkg) return false;
+  const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+  return UI_PACKAGES.some(name => name in deps);
 }
 
 // Languages with existing tests come first, then by how much source code they have.
@@ -93,12 +132,23 @@ export function extensionOf(rel: string): string {
 
 type Draft = Omit<Project, 'hasTests' | 'sources'>;
 
+// Copilot words the language in its own way ("JavaScript", "Node.js", ".NET"). The adapters and setup checks match these exact names.
+export function canonicalLanguage(label: string): string {
+  const name = label.trim();
+  if (/typescript|javascript|node/i.test(name)) return 'TypeScript/JavaScript';
+  if (/python/i.test(name)) return 'Python';
+  if (/^(go|golang)$/i.test(name)) return 'Go';
+  if (/c#|csharp|c-sharp|\.net|dotnet/i.test(name)) return 'C#';
+  if (/^java$/i.test(name)) return 'Java';
+  return name;
+}
+
 // Checks one project from Copilot's reply. Paths must be files in the repo, and the folder must exist.
 function toDraft(raw: unknown, known: Set<string>, visible: string[]): Draft | undefined {
   if (typeof raw !== 'object' || raw === null) return undefined;
   const p = raw as Record<string, unknown>;
   const root = typeof p.root === 'string' ? p.root.trim().replace(/^\.\/?/, '').replace(/\/+$/, '') : undefined;
-  const language = typeof p.language === 'string' ? p.language.trim() : '';
+  const language = typeof p.language === 'string' ? canonicalLanguage(p.language) : '';
   if (root === undefined || !language) return undefined;
   if (root !== '' && !visible.some(f => f.startsWith(`${root}/`))) return undefined;
 
@@ -177,7 +227,7 @@ async function readFiles(
 }
 
 // Reads the first JSON object in a reply. An unreadable reply gives undefined.
-function parseJson<T>(reply: string): T | undefined {
+export function parseJson<T>(reply: string): T | undefined {
   const match = /\{[\s\S]*\}/.exec(reply);
   if (!match) return undefined;
   try {

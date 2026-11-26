@@ -3,9 +3,11 @@ import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { createBranchFromLatest, currentBranch, isGitRepo, listBranches, repoRoot, trackedFiles } from './gitOps';
-import { commandForFramework, detectProjects, ownerOf, rankLanguages } from './analysis';
+import { commandForFramework, detectProjects, isFrontendProject, ownerOf, rankLanguages } from './analysis';
+import { resetCopilotStop, stopCopilotRequests } from './copilot';
+import { stopRunningCommands } from './shell';
 import { checkTools, runSetup } from './preflight';
-import { useSupportedFrameworks } from './languages/adapters';
+import { SUPPORTED_LANGUAGES, useSupportedFrameworks } from './languages/adapters';
 import { filesNeedingTests, listSourceFiles, runGeneration } from './testRunner';
 import { writeReportFiles } from './reportHtml';
 import { getHtml } from './webview';
@@ -22,6 +24,7 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
   private state: AppState = {
     projects: [],
     languages: [],
+    unsupported: [],
     tools: [],
     branches: [],
     branchReady: false,
@@ -52,6 +55,10 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
       switch (msg.type) {
         case 'connect':
           await this.connect();
+          break;
+        case 'backToConnect':
+          this.resetRepo();
+          this.state.showConnect = true;
           break;
         case 'setLanguage':
           this.state.language = msg.value;
@@ -104,8 +111,9 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
           this.state.choosing = false;
           this.state.selected = [];
           break;
-        // Steps back one screen: completed → ready, file chooser → ready, ready → branch.
+        // Steps back one screen: completed → ready, file chooser → ready, ready → branch. Ignored while a run is going.
         case 'goBack':
+          if (this.state.running) break;
           if (this.state.report) {
             this.state.report = undefined;
           } else if (this.state.choosing) {
@@ -125,7 +133,12 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
           await this.start(true);
           break;
         case 'cancel':
+          if (!this.state.running || this.cancelRequested) break;
           this.cancelRequested = true;
+          this.state.status = 'Cancelling…';
+          this.post();
+          stopCopilotRequests();
+          stopRunningCommands();
           break;
         case 'openHtml':
           await this.openHtml();
@@ -148,8 +161,9 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
 
   private stage(): Stage {
     const s = this.state;
-    if (!s.model) return 'connect';
+    if (!s.model || s.showConnect) return 'connect';
     if (!s.repoPath) return 'repo';
+    if (s.projects.length === 0) return 'unsupported';
     if (s.running) return 'running';
     if (s.report) return 'done';
     if (!s.branchReady) return 'branch';
@@ -162,6 +176,7 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
 
   private async connect(): Promise<void> {
     this.state.status = 'Connecting to Copilot…';
+    this.state.showConnect = false;
     this.post();
     try {
       const models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
@@ -179,7 +194,7 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
 
   // Re-reads the repository opened in VS Code when the workspace folders change.
   private async reloadRepo(): Promise<void> {
-    if (!this.state.model || this.state.running) return;
+    if (!this.state.model || this.state.running || this.state.showConnect) return;
     try {
       await this.loadRepo();
     } catch (err) {
@@ -203,9 +218,23 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
     const repo = await repoRoot(folder);
 
     const files = await trackedFiles(repo);
-    const projects = (await detectProjects(repo, files)).map(useSupportedFrameworks);
-    if (projects.length === 0) {
+    const detected = await detectProjects(repo, files);
+    if (detected.length === 0) {
       throw new Error('No project found. The repository needs a build or package file, or source code in a recognized language.');
+    }
+    const frontend = await Promise.all(detected.map(p => isFrontendProject(repo, p)));
+    const frontendRoots = detected.filter((_, i) => frontend[i]).map(p => p.root).filter(r => r !== '');
+    // A project inside a frontend folder (for example a Capacitor android/ or ios/ shell) belongs to that frontend.
+    const isFrontend = detected.map((p, i) => frontend[i] || frontendRoots.some(r => p.root.startsWith(`${r}/`)));
+    const unsupported = [...new Set(detected.filter((_, i) => isFrontend[i]).map(p => p.root || 'repository root'))];
+    // Only backend languages the agent can write tests for are listed; other languages are left out.
+    const projects = detected.filter((p, i) => !isFrontend[i] && SUPPORTED_LANGUAGES.includes(p.language)).map(useSupportedFrameworks);
+    if (projects.length === 0) {
+      // Only frontend projects: show the "not supported yet" screen instead of the setup steps.
+      this.resetRepo();
+      this.state.repoPath = repo;
+      this.state.unsupported = unsupported;
+      return;
     }
     const base = await currentBranch(repo);
     if (!base) {
@@ -216,6 +245,7 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
     this.resetRepo();
     this.state.repoPath = repo;
     this.state.projects = projects;
+    this.state.unsupported = unsupported;
     this.state.languages = rankLanguages(projects);
     this.state.language = this.state.languages[0];
     this.state.projectRoot = this.defaultProjectRoot();
@@ -253,17 +283,27 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
   }
 
   // Runs the install command of one item the user allowed, then checks again.
+  // A failed install usually needs administrator rights, so the user is told to ask an admin. A successful install needs a restart before the tool is on PATH.
   private async installTool(name: string): Promise<void> {
     const item = this.state.tools.find(t => t.name === name && t.run);
     if (!item?.run) throw new Error('Nothing to install for this item.');
     if (this.state.running) throw new Error('Wait for the current run to finish first.');
     this.state.status = `Installing ${item.name}…`;
     this.post();
+    let failure: string | undefined;
     try {
       await runSetup(item.run);
+    } catch (err) {
+      failure = err instanceof Error ? err.message : String(err);
     } finally {
       this.state.status = undefined;
       await this.refreshTools();
+    }
+    const after = this.state.tools.find(t => t.name === name);
+    if (failure) {
+      this.state.error = `Could not install ${item.name}. This usually needs administrator rights. Contact your admin to install ${item.name}, then restart VS Code to continue.\n${failure}`;
+    } else if (after && !after.ok) {
+      this.state.error = `${item.name} was installed. Restart VS Code to continue, then click Recheck tools.`;
     }
   }
 
@@ -341,6 +381,7 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
       repoPath: undefined,
       projects: [],
       languages: [],
+      unsupported: [],
       language: undefined,
       projectRoot: undefined,
       tools: [],
@@ -399,6 +440,7 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
     this.state.running = true;
     this.state.report = undefined;
     this.cancelRequested = false;
+    resetCopilotStop();
     this.post();
     try {
       this.state.report = await runGeneration(
@@ -412,8 +454,14 @@ export class AutoTestsViewProvider implements vscode.WebviewViewProvider {
       );
       await fs.mkdir(path.dirname(this.reportFile), { recursive: true });
       await writeReportFiles(this.state.report, repoPath, this.htmlFile, this.reportFile);
+    } catch (err) {
+      // A cancel stops the Copilot call and test commands mid-step, so their errors are expected. Anything else is a real failure.
+      if (!this.cancelRequested) throw err;
+      this.state.error = 'Test generation was cancelled. Tests already written stay on the branch.';
     } finally {
       this.state.running = false;
+      this.state.status = undefined;
+      resetCopilotStop();
     }
   }
 

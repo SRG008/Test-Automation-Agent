@@ -8,11 +8,39 @@ const exists = (p: string): Promise<boolean> => fs.access(p).then(() => true, ()
 
 const installHint = (name: string): string => `Install ${name} and make sure it is on the PATH, restart VS Code, then click Recheck tools`;
 
-// Checks that a program is on the PATH of this machine.
+// Each program's display name, Windows winget package id, and download page.
+const INSTALL: Record<string, { label: string; id: string; url: string }> = {
+  node: { label: 'Node.js', id: 'OpenJS.NodeJS.LTS', url: 'https://nodejs.org/' },
+  python: { label: 'Python', id: 'Python.Python.3.12', url: 'https://www.python.org/downloads/' },
+  go: { label: 'Go', id: 'GoLang.Go', url: 'https://go.dev/dl/' },
+  java: { label: 'Java JDK', id: 'EclipseAdoptium.Temurin.21.JDK', url: 'https://adoptium.net/' },
+  mvn: { label: 'Maven', id: 'Apache.Maven', url: 'https://maven.apache.org/download.cgi' },
+  gradle: { label: 'Gradle', id: 'Gradle.Gradle', url: 'https://gradle.org/install/' },
+  dotnet: { label: '.NET SDK', id: 'Microsoft.DotNet.SDK.8', url: 'https://dotnet.microsoft.com/download' },
+};
+
+// The Allow command for an SDK on Windows. Other systems get the download link only.
+function wingetRun(id: string, cwd: string): ToolCheck['run'] {
+  if (process.platform !== 'win32') return undefined;
+  return { program: 'winget', args: ['install', '--id', id, '-e', '--accept-package-agreements', '--accept-source-agreements'], cwd };
+}
+
+// Checks that a program is on the PATH of this machine. Known SDKs get an install command.
 async function onPath(program: string, cwd: string): Promise<ToolCheck> {
   const lookup = process.platform === 'win32' ? 'where' : 'which';
   const run = await runCommand(lookup, [program], cwd, 20_000);
-  return { name: program, ok: run.code === 0, hint: installHint(program), url: '', required: true };
+  const ok = run.code === 0;
+  const sdk = INSTALL[program];
+  if (!sdk) return { name: program, ok, hint: installHint(program), url: '', required: true };
+  return { name: sdk.label, ok, hint: installHint(sdk.label), url: sdk.url, required: true, run: wingetRun(sdk.id, cwd) };
+}
+
+// Python is found through the interpreter the project uses (py launcher, venv, or python).
+async function pythonCheck(root: string): Promise<ToolCheck> {
+  const interpreter = await pythonFor(root);
+  const run = await runCommand(interpreter, ['--version'], root, 20_000);
+  const sdk = INSTALL.python;
+  return { name: sdk.label, ok: run.code === 0, hint: installHint(sdk.label), url: sdk.url, required: true, run: wingetRun(sdk.id, root) };
 }
 
 // Finds the program a project's test command starts with and checks that it runs on this machine.
@@ -23,11 +51,7 @@ async function checkProgram(repo: string, project: Project): Promise<ToolCheck |
   const root = path.join(repo, project.root);
   const program = command.split(/\s+/)[0].replace(/^"|"$/g, '');
 
-  if (program === 'python') {
-    const interpreter = await pythonFor(root);
-    const run = await runCommand(interpreter, ['--version'], root, 20_000);
-    return { name: 'Python', ok: run.code === 0, hint: installHint('Python 3 (python.org)'), url: 'https://www.python.org/downloads/', required: true };
-  }
+  if (program === 'python') return pythonCheck(root);
   if (/[\\/]/.test(program)) {
     const found = await exists(path.resolve(root, program));
     return { name: program, ok: found, hint: `Create or install ${program} in the project, then click Recheck tools`, url: '', required: true };
@@ -35,14 +59,28 @@ async function checkProgram(repo: string, project: Project): Promise<ToolCheck |
   return onPath(program, root);
 }
 
-// Work a project needs before tests can be written: packages, the chosen framework, and config files.
+// Work a project needs before tests can be written: the language SDK and build tool, packages, the chosen framework, and config files.
 // An item with run can be installed by the host; autoRun items install without asking.
 async function setupChecks(repo: string, project: Project): Promise<ToolCheck[]> {
   const root = path.join(repo, project.root);
   const items: ToolCheck[] = [];
+  const has = (name: string): Promise<boolean> => exists(path.join(root, name));
+
+  if (project.language === 'Python') items.push(await pythonCheck(root));
+  if (project.language === 'Go') items.push(await onPath('go', root));
+  if (project.language === 'C#') items.push(await onPath('dotnet', root));
+  if (project.language === 'Java') {
+    items.push(await onPath('java', root));
+    if ((await has('pom.xml')) && !(await has('mvnw')) && !(await has('mvnw.cmd'))) items.push(await onPath('mvn', root));
+    if (((await has('build.gradle')) || (await has('build.gradle.kts'))) && !(await has('gradlew')) && !(await has('gradlew.bat'))) {
+      items.push(await onPath('gradle', root));
+    }
+  }
 
   if (project.language === 'TypeScript/JavaScript' && (await exists(path.join(root, 'package.json')))) {
+    items.push(await onPath('node', root));
     items.push(await onPath('npm', root));
+
     const hasModules = await exists(path.join(root, 'node_modules'));
     const args = [(await exists(path.join(root, 'package-lock.json'))) ? 'ci' : 'install'];
     items.push({

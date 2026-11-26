@@ -939,11 +939,15 @@ export function adapterFor(project: Project): LanguageAdapter {
   return ADAPTERS[project.language] ?? genericAdapter(project);
 }
 
+// The backend languages the agent can write tests for. Other languages are left out of the sidebar.
+export const SUPPORTED_LANGUAGES = ['Python', 'TypeScript/JavaScript', 'Go', 'Java', 'C#'];
+
 // The frameworks the built-in adapter can run for a language. Undefined for languages on the generic adapter.
 function builtInFrameworks(language: string): string[] | undefined {
   switch (language) {
     case 'Python': return ['pytest', 'unittest'];
     case 'TypeScript/JavaScript': return [...Object.keys(TS_TOOLS), ...TS_OWN_RUNNERS];
+    case 'Go': return ['testing'];
     case 'Java': return Object.keys(JAVA_FRAMEWORK);
     case 'C#': return Object.keys(CS_TEMPLATE);
     default: return undefined;
@@ -952,11 +956,14 @@ function builtInFrameworks(language: string): string[] | undefined {
 
 // Keeps only the frameworks the built-in adapter can run, spelled the way the adapter expects.
 // A framework found in the tests that the adapter cannot run is dropped, along with its test command.
+// When a language has one supported framework (Go), that framework is used even if Copilot named another.
 export function useSupportedFrameworks(project: Project): Project {
   const supported = builtInFrameworks(project.language);
   if (!supported) return project;
   const match = (name: string): string | undefined => supported.find(f => f.toLowerCase() === name.trim().toLowerCase());
-  const framework = project.framework ? match(project.framework) : undefined;
+  const onlyOne = supported.length === 1 ? supported[0] : undefined;
+  const framework = (project.framework ? match(project.framework) : undefined) ?? onlyOne;
   const frameworkOptions = [...new Set(project.frameworkOptions.map(match).filter((f): f is string => f !== undefined))];
+  if (frameworkOptions.length === 0 && onlyOne) frameworkOptions.push(onlyOne);
   return { ...project, framework, frameworkOptions, testCommand: framework ? project.testCommand : undefined };
 }

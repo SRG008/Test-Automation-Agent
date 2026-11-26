@@ -18,9 +18,15 @@ export function getHtml(cspSource: string): string {
   .btn:active:not(:disabled) { transform: scale(.98); }
   .btn.secondary { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
   .btn:disabled { opacity: .5; cursor: default; }
+  .step .btn { display: inline-block; width: auto; margin: 4px 0 2px; padding: 4px 12px; font-size: 12px; }
+  .coming { display: flex; align-items: center; justify-content: center; width: 100%; height: 55vh; min-height: 280px; border-radius: 12px; margin-bottom: 14px; background: linear-gradient(135deg, var(--vscode-button-background), var(--vscode-editorWidget-background)); }
+  .coming svg { display: block; width: 100%; height: 100%; }
+  .unsupported-screen { display: flex; flex-direction: column; min-height: calc(100vh - 60px); }
+  .unsupported-screen .btn { margin-top: auto; }
   .topbar { display: flex; align-items: center; margin: -4px 0 6px; }
   .icon-btn { display: inline-flex; align-items: center; gap: 4px; padding: 3px 6px 3px 4px; border: none; border-radius: 3px; cursor: pointer; font: inherit; font-size: 12px; background: transparent; color: var(--vscode-foreground); }
-  .icon-btn:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, .2)); }
+  .icon-btn:disabled { opacity: .4; cursor: not-allowed; background: transparent; }
+  .icon-btn:hover:not(:disabled) { background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, .2)); }
   .icon-btn svg { width: 16px; height: 16px; fill: currentColor; }
   label { display: block; font-size: 12px; opacity: .85; margin-top: 10px; }
   select, input { width: 100%; box-sizing: border-box; margin: 4px 0 6px; padding: 4px; font: inherit; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, transparent); }
@@ -203,9 +209,9 @@ export function getHtml(cspSource: string): string {
       var help = '';
       if (!t.ok && t.run) {
         var program = t.run.program.replace(/^.*[\\\\/]/, '');
-        help = ' <button class="btn secondary" data-setup="' + esc(t.name) + '">Allow: ' + esc([program].concat(t.run.args).join(' ')) + '</button>';
+        help = '<br><button class="btn secondary" data-setup="' + esc(t.name) + '">Allow: ' + esc([program].concat(t.run.args).join(' ')) + '</button>';
       } else if (!t.ok && t.url) {
-        help = ' <button class="btn secondary" data-url="' + esc(t.url) + '">' + esc(t.hint) + '</button>';
+        help = '<br><button class="btn secondary" data-url="' + esc(t.url) + '">' + esc(t.hint) + '</button>';
       } else if (!t.ok) {
         help = ' <span class="muted">' + esc(t.hint) + '</span>';
       }
@@ -273,12 +279,34 @@ export function getHtml(cspSource: string): string {
       }).join('') + '</select>';
     return html + '<p class="muted">The test command is set up automatically from the framework.</p>';
   }
+  // The "coming soon" banner with its image. Used for frontend-only repos and above the branch step of mixed repos.
+  function comingSoonBanner() {
+    return '<div class="coming"><svg viewBox="0 0 320 200" preserveAspectRatio="xMidYMid meet" aria-hidden="true">'
+      + '<path d="M0 150 Q80 118 160 150 T320 150 V200 H0Z" style="fill:var(--vscode-button-background);opacity:.4"/>'
+      + '<circle cx="256" cy="50" r="22" style="fill:var(--vscode-foreground);opacity:.2"/>'
+      + '<text x="160" y="92" text-anchor="middle" font-size="26" font-weight="600" style="fill:var(--vscode-foreground)">Frontend support</text>'
+      + '<text x="160" y="124" text-anchor="middle" font-size="17" style="fill:var(--vscode-foreground)">Coming in an upcoming release</text>'
+      + '</svg></div>';
+  }
+  // Shown when every project is a frontend. No actions are offered except Back; the frontend support is coming in a later release.
+  function renderUnsupported() {
+    var names = (state.unsupported || []).map(function (n) { return esc(n); }).join(', ');
+    return '<div class="unsupported-screen">' + comingSoonBanner()
+      + '<h2>Frontend not supported yet</h2>'
+      + '<p>This repository has frontend projects: ' + names + '.</p>'
+      + '<p class="muted">Auto Tests supports backend projects for now (.NET, Java, Python, Go and Node.js backends). Frontend support will be released in an upcoming version.</p>'
+      + btn('Back to Connect & Analyze', 'backToConnect', 'secondary') + '</div>';
+  }
   function renderBranch() {
+    var unsupportedNote = (state.unsupported || []).length
+      ? comingSoonBanner() + '<p class="muted">Frontend projects are not supported yet and are left out: ' + (state.unsupported || []).map(function (n) { return esc(n); }).join(', ') + '.</p>'
+      : '';
     var langField = state.languages.length > 1
       ? selectField('Language', 'setLanguage', state.languages, state.language)
       : '<p class="muted">Language: ' + esc(state.language) + '</p>';
     if (missingNames().length > 0) {
       return '<h2>Auto Tests</h2>' + connectedLine() + repoLine() + '<hr>'
+        + unsupportedNote
         + langField
         + toolsBlock()
         + installNote()
@@ -286,12 +314,14 @@ export function getHtml(cspSource: string): string {
         + errorBlock();
     }
     return '<h2>Auto Tests</h2>' + connectedLine() + repoLine() + '<hr>'
+      + unsupportedNote
       + langField
       + toolsBlock()
       + '<p class="muted">Pulls the latest of the base branch, then creates the new branch on top of it.</p>'
       + selectField('Base branch', 'setBaseBranch', state.branches, state.baseBranch)
       + '<label>New branch name</label><input data-change="setNewBranch" value="' + esc(state.newBranch) + '">'
       + btn('Pull Latest & Create Branch', 'createBranch')
+      + btn('Back to Connect & Analyze', 'backToConnect', 'secondary')
       + errorBlock();
   }
   function renderReady() {
@@ -401,6 +431,7 @@ export function getHtml(cspSource: string): string {
       + '<p class="muted">Branch: ' + esc(state.newBranch) + '</p>'
       + '<div class="track"><div class="fill" style="width:' + pct + '%"></div></div>'
       + '<p class="muted">' + pct + '% complete</p>'
+      + (p.note ? '<div class="muted"><span class="spinner"></span> ' + esc(p.note) + '</div>' : '')
       + '<div class="timing">Elapsed: <b id="elapsed">0s</b><br>Estimated time left: <b id="eta">…</b></div>'
       + liveBlock
       + steps
@@ -434,16 +465,17 @@ export function getHtml(cspSource: string): string {
 
   var collapsed = {};
   var lastScreen = '';
-  // Screens that have a previous step. The running screen is left out because Cancel stops it.
-  var BACK_STAGES = { ready: true, done: true };
+  // Screens that have a previous step. While a run is going the Back button is shown but disabled.
+  var BACK_STAGES = { ready: true, done: true, running: true };
   function topBar() {
     if (!BACK_STAGES[state.stage]) return '';
-    return '<div class="topbar"><button class="icon-btn" data-action="goBack" title="Back to previous step" aria-label="Back to previous step">'
+    var disabled = state.stage === 'running' ? ' disabled' : '';
+    return '<div class="topbar"><button class="icon-btn" data-action="goBack"' + disabled + ' title="Back to previous step" aria-label="Back to previous step">'
       + '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M7.78 12.53a.75.75 0 0 1-1.06 0L2.47 8.28a.75.75 0 0 1 0-1.06l4.25-4.25a.75.75 0 0 1 1.06 1.06L4.81 7h7.44a.75.75 0 0 1 0 1.5H4.81l2.97 2.97a.75.75 0 0 1 0 1.06z"/></svg>'
       + '<span>Back</span></button></div>';
   }
   function render() {
-    var views = { connect: renderConnect, repo: renderRepo, branch: renderBranch, ready: renderReady, running: renderRunning, done: renderDone };
+    var views = { connect: renderConnect, repo: renderRepo, unsupported: renderUnsupported, branch: renderBranch, ready: renderReady, running: renderRunning, done: renderDone };
     // Fade in only when the screen changes, so re-renders on each tick don't replay the animation.
     var screen = state.stage + ':' + !!state.choosing;
     if (screen !== lastScreen) {
